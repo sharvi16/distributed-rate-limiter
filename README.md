@@ -200,14 +200,14 @@ The stack launches:
 
 ## 🧪 Comprehensive Automated Test Suite
 
-The test suite contains **106 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
+The test suite contains **109 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
 
 ```bash
 pytest tests/ -v
 ```
 
 ### Test Categories:
-- **`tests/security/test_admin_protection.py`** (12 tests): Admin key enforcement (fail-closed, missing/empty key denial, invalid key denial, valid key acceptance, constant-time comparison, error neutrality, production startup validation for existence/length/entropy/placeholders).
+- **`tests/security/test_admin_protection.py`** (15 tests): Admin key enforcement (fail-closed, missing/empty key denial, invalid key denial, valid key acceptance, UTF-8 byte constant-time comparison to prevent timing attacks and avoid 500 errors on non-ASCII input, single environment variable authoritative source with no stale global fallback, error message neutrality, production startup validation for existence/length/entropy/placeholders).
 - **`tests/security/test_priority1_audit.py`** (43 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy (Shannon entropy & diversity vs length), known placeholder blocklist, strict boolean configuration parsing, startup configuration validation through FastAPI lifespan, production vs development environment isolation, prohibition of unauthenticated headers in production, and identity anti-spoofing.
 - **`tests/unit/test_token_bucket.py`** (11 tests): Capacity, refill math, oversized requests, atomic concurrency, failure modes (`fail_closed`, `fail_open`, `local_fallback`), and RFC headers.
 - **`tests/unit/test_challenge.py`** (8 tests): Cryptographic ID generation, single-use enforcement, attempt exhaustion, user-session binding, and answer leak prevention.

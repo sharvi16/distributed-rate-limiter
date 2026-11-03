@@ -108,7 +108,6 @@ def test_penalty_box_returns_retry_after(client):
 def test_admin_api_key_protection_on_model_stats(client, monkeypatch):
     # Missing / unset ADMIN_API_KEY must deny access (401), NEVER grant open access (fail-closed)
     monkeypatch.setenv("ADMIN_API_KEY", "")
-    monkeypatch.setattr(main, "ADMIN_API_KEY", "")
     res_open = client.get("/model-stats")
     assert res_open.status_code == 401
     assert "invalid or missing admin credentials" in res_open.json()["detail"]
@@ -116,7 +115,6 @@ def test_admin_api_key_protection_on_model_stats(client, monkeypatch):
     # Test protected access when ADMIN_API_KEY is configured
     admin_key = "test-admin-secret-key-at-least-32-chars-long"
     monkeypatch.setenv("ADMIN_API_KEY", admin_key)
-    monkeypatch.setattr(main, "ADMIN_API_KEY", admin_key)
 
     # Missing header -> 401
     res_no_key = client.get("/model-stats")

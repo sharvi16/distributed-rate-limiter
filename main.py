@@ -65,9 +65,6 @@ ip_limiter = RateLimiter(
 detector = AdaptiveSpamDetector(redis_client=limiter.redis)
 
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
-
-
 def verify_admin_key(x_admin_key: Optional[str] = Header(None, alias="x-admin-key")) -> bool:
     """
     Protects internal model diagnostics and metrics from unauthorized inspection.
@@ -75,18 +72,24 @@ def verify_admin_key(x_admin_key: Optional[str] = Header(None, alias="x-admin-ke
     Security Rules:
       1. Missing or empty ADMIN_API_KEY configuration NEVER grants access (fail-closed).
       2. Missing or incorrect 'x-admin-key' header returns HTTP 401 Unauthorized.
-      3. Uses constant-time comparison (hmac.compare_digest) to prevent timing attacks.
-      4. Does not leak whether the key is missing from server configuration or mismatched.
-      5. The actual key is never logged.
+      3. Compares UTF-8 encoded bytes using hmac.compare_digest to safely handle
+         non-ASCII characters without raising unexpected 500 errors.
+      4. Single authoritative configuration source: os.getenv("ADMIN_API_KEY") (no stale global fallback).
+      5. Does not leak whether the key is missing from server configuration or mismatched.
+      6. The actual key is never logged.
     """
-    configured_key = os.getenv("ADMIN_API_KEY", "").strip() or globals().get("ADMIN_API_KEY", "").strip()
+    configured_key = os.getenv("ADMIN_API_KEY", "").strip()
     if not configured_key or not x_admin_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: invalid or missing admin credentials."
         )
 
-    if not hmac.compare_digest(x_admin_key.strip(), configured_key):
+    # Convert to UTF-8 bytes to safely handle non-ASCII headers in constant time
+    header_bytes = x_admin_key.strip().encode("utf-8")
+    configured_bytes = configured_key.encode("utf-8")
+
+    if not hmac.compare_digest(header_bytes, configured_bytes):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: invalid or missing admin credentials."
