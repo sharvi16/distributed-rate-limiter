@@ -235,6 +235,23 @@ def load_rate_limiter_config() -> Tuple[float, float, float, float, FailureMode]
     return user_cap, user_refill, ip_cap, ip_refill, failure_mode
 
 
+def parse_bool_env(var_name: str, default: bool) -> bool:
+    """
+    Parses a boolean environment variable strictly.
+    Accepts: true, 1, yes, on / false, 0, no, off.
+    Raises ValueError on unrecognized non-empty value.
+    """
+    val = os.getenv(var_name)
+    if val is None or val.strip() == "":
+        return default
+    clean = val.strip().lower()
+    if clean in ("true", "1", "yes", "on"):
+        return True
+    if clean in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(f"Invalid boolean value for environment variable {var_name}: {val!r}")
+
+
 def validate_rate_limiter_configuration() -> Tuple[float, float, float, float, FailureMode]:
     """
     Validates rate limiter environment variables at application startup.
@@ -309,7 +326,12 @@ class RateLimiter:
         enable_fallback: Optional[bool] = None,
         max_local_keys: int = 10000,
         redis_client: Optional[redis.Redis] = None,
-        redis_password: Optional[str] = None
+        redis_password: Optional[str] = None,
+        ssl_certfile: Optional[str] = None,
+        ssl_keyfile: Optional[str] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_cert_reqs: Optional[str] = None,
+        ssl_check_hostname: Optional[bool] = None
     ):
         """
         Initialize the Token Bucket Rate Limiter.
@@ -324,12 +346,51 @@ class RateLimiter:
             LRU batch eviction of the oldest 20% entries (at least 1 entry) to amortize sorting overhead.
         :param redis_client: Optional pre-configured Redis client instance (e.g. for testing).
         :param redis_password: Optional Redis authentication password. If omitted, checks REDIS_PASSWORD env var.
+        :param ssl_certfile: Path to client SSL certificate for mTLS.
+        :param ssl_keyfile: Path to client SSL private key for mTLS.
+        :param ssl_ca_certs: Path to trusted CA bundle for Redis TLS verification.
+        :param ssl_cert_reqs: Certificate requirement mode (e.g. 'required').
+        :param ssl_check_hostname: Whether to verify hostname against certificate.
         """
         # Validate initialization invariants (reject booleans, None, strings, NaN, infinity, <= 0)
         self.capacity = validate_positive_number("capacity", capacity)
         self.refill_rate = validate_positive_number("refill_rate", refill_rate)
         self.max_local_keys = validate_positive_int("max_local_keys", max_local_keys)
         self.redis_url = redis_url
+
+        # SSL / mTLS Configuration
+        self.ssl_certfile = ssl_certfile if ssl_certfile is not None else (os.getenv("REDIS_SSL_CERTFILE", "").strip() or None)
+        self.ssl_keyfile = ssl_keyfile if ssl_keyfile is not None else (os.getenv("REDIS_SSL_KEYFILE", "").strip() or None)
+        self.ssl_ca_certs = ssl_ca_certs if ssl_ca_certs is not None else (os.getenv("REDIS_SSL_CA_CERTS", "").strip() or None)
+        self.ssl_cert_reqs = ssl_cert_reqs if ssl_cert_reqs is not None else (os.getenv("REDIS_SSL_CERT_REQS", "").strip() or None)
+        self.ssl_check_hostname = ssl_check_hostname
+
+        # Enforce TLS scheme integrity: plain redis:// can NEVER claim TLS or use SSL settings
+        is_rediss = self.redis_url.startswith("rediss://")
+        is_redis_plain = self.redis_url.startswith("redis://")
+        redis_ssl_val = os.getenv("REDIS_SSL")
+        redis_ssl_bool = parse_bool_env("REDIS_SSL", False) if (redis_ssl_val is not None and redis_ssl_val.strip() != "") else None
+
+        if is_redis_plain and (redis_ssl_bool is True or self.ssl_certfile or self.ssl_keyfile or self.ssl_ca_certs):
+            raise ValueError(
+                "Insecure TLS configuration: plain 'redis://' connection scheme cannot claim TLS or use SSL/mTLS parameters. "
+                "REDIS_URL must use the 'rediss://' scheme for TLS connections."
+            )
+
+        if is_rediss and redis_ssl_bool is False:
+            raise ValueError(
+                "Contradictory TLS configuration: REDIS_URL uses 'rediss://' scheme, but REDIS_SSL is explicitly set to false."
+            )
+
+        if is_rediss and (self.ssl_certfile or self.ssl_keyfile):
+            if not self.ssl_certfile or not self.ssl_keyfile:
+                raise ValueError("mTLS configuration requires both ssl_certfile and ssl_keyfile.")
+            if not os.path.isfile(self.ssl_certfile):
+                raise ValueError(f"mTLS client certificate file does not exist: {self.ssl_certfile!r}")
+            if not os.path.isfile(self.ssl_keyfile):
+                raise ValueError(f"mTLS client private key file does not exist: {self.ssl_keyfile!r}")
+            if self.ssl_ca_certs and not os.path.isfile(self.ssl_ca_certs):
+                raise ValueError(f"mTLS CA certificate file does not exist: {self.ssl_ca_certs!r}")
 
         # Redis password configuration: explicitly passed or from environment
         parsed = urllib.parse.urlsplit(self.redis_url)
@@ -392,7 +453,12 @@ class RateLimiter:
         failure_mode: Optional[Union[FailureMode, str]] = None,
         max_local_keys: Optional[int] = None,
         redis_url: Optional[str] = None,
-        redis_password: Optional[str] = None
+        redis_password: Optional[str] = None,
+        ssl_certfile: Optional[str] = None,
+        ssl_keyfile: Optional[str] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_cert_reqs: Optional[str] = None,
+        ssl_check_hostname: Optional[bool] = None
     ) -> None:
         """
         Dynamically updates rate limiter configuration in place.
@@ -446,9 +512,40 @@ class RateLimiter:
                     "Contradictory Redis credentials: REDIS_PASSWORD does not match the password supplied in REDIS_URL."
                 )
 
+        # SSL / mTLS validation
+        new_ssl_certfile = ssl_certfile if ssl_certfile is not None else self.ssl_certfile
+        new_ssl_keyfile = ssl_keyfile if ssl_keyfile is not None else self.ssl_keyfile
+        new_ssl_ca_certs = ssl_ca_certs if ssl_ca_certs is not None else self.ssl_ca_certs
+        new_ssl_cert_reqs = ssl_cert_reqs if ssl_cert_reqs is not None else self.ssl_cert_reqs
+        new_ssl_check_hostname = ssl_check_hostname if ssl_check_hostname is not None else self.ssl_check_hostname
+
+        target_is_rediss = target_url.startswith("rediss://")
+        target_is_plain = target_url.startswith("redis://")
+
+        if target_is_plain and (new_ssl_certfile or new_ssl_keyfile or new_ssl_ca_certs):
+            raise ValueError(
+                "Insecure TLS configuration: plain 'redis://' connection scheme cannot claim TLS or use SSL/mTLS parameters. "
+                "REDIS_URL must use the 'rediss://' scheme for TLS connections."
+            )
+
+        if target_is_rediss and (new_ssl_certfile or new_ssl_keyfile):
+            if not new_ssl_certfile or not new_ssl_keyfile:
+                raise ValueError("mTLS configuration requires both ssl_certfile and ssl_keyfile.")
+            if not os.path.isfile(new_ssl_certfile):
+                raise ValueError(f"mTLS client certificate file does not exist: {new_ssl_certfile!r}")
+            if not os.path.isfile(new_ssl_keyfile):
+                raise ValueError(f"mTLS client private key file does not exist: {new_ssl_keyfile!r}")
+            if new_ssl_ca_certs and not os.path.isfile(new_ssl_ca_certs):
+                raise ValueError(f"mTLS CA certificate file does not exist: {new_ssl_ca_certs!r}")
+
         reconnect_redis = (
             (new_redis_url is not None and new_redis_url != self.redis_url) or
-            (redis_password is not None and new_redis_password != self.redis_password)
+            (redis_password is not None and new_redis_password != self.redis_password) or
+            (ssl_certfile is not None and ssl_certfile != self.ssl_certfile) or
+            (ssl_keyfile is not None and ssl_keyfile != self.ssl_keyfile) or
+            (ssl_ca_certs is not None and ssl_ca_certs != self.ssl_ca_certs) or
+            (ssl_cert_reqs is not None and ssl_cert_reqs != self.ssl_cert_reqs) or
+            (ssl_check_hostname is not None and ssl_check_hostname != self.ssl_check_hostname)
         )
 
         # All validations passed; atomically mutate instance state under lock
@@ -466,6 +563,16 @@ class RateLimiter:
                     self.redis_url = new_redis_url
                 if redis_password is not None:
                     self.redis_password = new_redis_password
+                if ssl_certfile is not None:
+                    self.ssl_certfile = new_ssl_certfile
+                if ssl_keyfile is not None:
+                    self.ssl_keyfile = new_ssl_keyfile
+                if ssl_ca_certs is not None:
+                    self.ssl_ca_certs = new_ssl_ca_certs
+                if ssl_cert_reqs is not None:
+                    self.ssl_cert_reqs = new_ssl_cert_reqs
+                if ssl_check_hostname is not None:
+                    self.ssl_check_hostname = new_ssl_check_hostname
                 self._init_redis()
 
     def _init_redis(self):
@@ -476,6 +583,16 @@ class RateLimiter:
                 "socket_connect_timeout": 1.0,
                 "socket_timeout": 1.0,
             }
+            if self.redis_url.startswith("rediss://"):
+                if self.ssl_certfile:
+                    kwargs["ssl_certfile"] = self.ssl_certfile
+                if self.ssl_keyfile:
+                    kwargs["ssl_keyfile"] = self.ssl_keyfile
+                if self.ssl_ca_certs:
+                    kwargs["ssl_ca_certs"] = self.ssl_ca_certs
+                kwargs["ssl_cert_reqs"] = self.ssl_cert_reqs or "required"
+                kwargs["ssl_check_hostname"] = self.ssl_check_hostname if self.ssl_check_hostname is not None else True
+
             parsed = urllib.parse.urlsplit(self.redis_url)
             url_pwd = urllib.parse.unquote(parsed.password) if parsed.password is not None else None
             if parsed.password:

@@ -456,6 +456,22 @@ def validate_redis_configuration() -> None:
     auth_mode = get_redis_auth_mode()
     redis_auth_required = is_redis_auth_required()
 
+    # Ensure REDIS_SSL=true cannot claim TLS while using a plain redis:// connection
+    redis_ssl_val = os.getenv("REDIS_SSL")
+    redis_ssl_bool = parse_bool_env("REDIS_SSL", False) if (redis_ssl_val is not None and redis_ssl_val.strip() != "") else None
+
+    if redis_url.startswith("redis://") and redis_ssl_bool is True:
+        raise ValueError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: Insecure TLS configuration: REDIS_SSL=true cannot claim TLS "
+            "while using a plain 'redis://' connection scheme. REDIS_URL must use 'rediss://' for encrypted connections."
+        )
+
+    if redis_url.startswith("rediss://") and redis_ssl_bool is False:
+        raise ValueError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: Contradictory TLS configuration: REDIS_URL uses 'rediss://' scheme, "
+            "but REDIS_SSL is explicitly set to false."
+        )
+
     # 1. Alternative authentication mode validation
     if auth_mode == "none":
         if is_prod:
@@ -465,11 +481,10 @@ def validate_redis_configuration() -> None:
             )
 
     elif auth_mode == "mtls":
-        is_tls = redis_url.startswith("rediss://") or parse_bool_env("REDIS_SSL", False)
-        if not is_tls:
+        if not redis_url.startswith("rediss://"):
             raise ValueError(
-                "CRITICAL SECURITY CONFIGURATION ERROR: REDIS_AUTH_MODE=mtls requires a TLS-enabled Redis connection. "
-                "REDIS_URL must use the 'rediss://' scheme or REDIS_SSL=true must be configured."
+                "CRITICAL SECURITY CONFIGURATION ERROR: REDIS_AUTH_MODE=mtls requires a TLS-enabled Redis connection with the 'rediss://' scheme. "
+                "A plain 'redis://' connection cannot claim TLS."
             )
         certfile = os.getenv("REDIS_SSL_CERTFILE", "").strip()
         keyfile = os.getenv("REDIS_SSL_KEYFILE", "").strip()

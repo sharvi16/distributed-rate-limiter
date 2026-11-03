@@ -54,7 +54,11 @@ app = FastAPI(
 # Service Initializations
 # -----------------------------------------------------------------------------
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-redis_password = os.getenv("REDIS_PASSWORD", "").strip() or None
+raw_pwd = os.getenv("REDIS_PASSWORD")
+redis_password = raw_pwd if (raw_pwd is not None and raw_pwd != "") else None
+ssl_certfile = os.getenv("REDIS_SSL_CERTFILE", "").strip() or None
+ssl_keyfile = os.getenv("REDIS_SSL_KEYFILE", "").strip() or None
+ssl_ca_certs = os.getenv("REDIS_SSL_CA_CERTS", "").strip() or None
 trusted_proxies_cfg = os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1")
 TRUSTED_PROXIES = parse_trusted_proxies(trusted_proxies_cfg)
 failure_mode_str = os.getenv("RATE_LIMITER_FAILURE_MODE", FailureMode.FAIL_CLOSED.value)
@@ -73,6 +77,9 @@ ip_refill_rate = parse_env_positive_float("IP_RATE_LIMITER_REFILL_RATE", default
 limiter = RateLimiter(
     redis_url=redis_url,
     redis_password=redis_password,
+    ssl_certfile=ssl_certfile,
+    ssl_keyfile=ssl_keyfile,
+    ssl_ca_certs=ssl_ca_certs,
     capacity=user_capacity,
     refill_rate=user_refill_rate,
     failure_mode=configured_failure_mode
@@ -82,6 +89,9 @@ limiter = RateLimiter(
 ip_limiter = RateLimiter(
     redis_url=redis_url,
     redis_password=redis_password,
+    ssl_certfile=ssl_certfile,
+    ssl_keyfile=ssl_keyfile,
+    ssl_ca_certs=ssl_ca_certs,
     capacity=ip_capacity,
     refill_rate=ip_refill_rate,
     failure_mode=configured_failure_mode
@@ -102,20 +112,31 @@ def sync_rate_limiter_configuration() -> None:
     """
     user_cap, user_refill, ip_cap, ip_refill, f_mode = validate_rate_limiter_configuration()
     cur_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-    cur_pwd = os.getenv("REDIS_PASSWORD", "").strip() or None
+    raw_cur_pwd = os.getenv("REDIS_PASSWORD")
+    cur_pwd = raw_cur_pwd if (raw_cur_pwd is not None and raw_cur_pwd != "") else None
+    cur_certfile = os.getenv("REDIS_SSL_CERTFILE", "").strip() or None
+    cur_keyfile = os.getenv("REDIS_SSL_KEYFILE", "").strip() or None
+    cur_ca_certs = os.getenv("REDIS_SSL_CA_CERTS", "").strip() or None
+
     limiter.configure(
         capacity=user_cap,
         refill_rate=user_refill,
         failure_mode=f_mode,
         redis_url=cur_url,
-        redis_password=cur_pwd
+        redis_password=cur_pwd,
+        ssl_certfile=cur_certfile,
+        ssl_keyfile=cur_keyfile,
+        ssl_ca_certs=cur_ca_certs
     )
     ip_limiter.configure(
         capacity=ip_cap,
         refill_rate=ip_refill,
         failure_mode=f_mode,
         redis_url=cur_url,
-        redis_password=cur_pwd
+        redis_password=cur_pwd,
+        ssl_certfile=cur_certfile,
+        ssl_keyfile=cur_keyfile,
+        ssl_ca_certs=cur_ca_certs
     )
     detector.redis = limiter.redis
     metrics_collector.set_redis(limiter.redis)

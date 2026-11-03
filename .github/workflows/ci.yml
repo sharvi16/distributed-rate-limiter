@@ -37,11 +37,137 @@ jobs:
 
       - name: Run Pytest Test Suite
         env:
-          REDIS_URL: redis://localhost:6379
-          REQUIRE_AUTH: "false"
-          ALLOW_UNAUTHENTICATED_DEV_HEADERS: "true"
-          ENVIRONMENT: "test"
-          AUTH_SECRET_KEY: "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e"
+            REDIS_URL: redis://localhost:6379
+            REQUIRE_AUTH: "false"
+            ALLOW_UNAUTHENTICATED_DEV_HEADERS: "true"
+            ENVIRONMENT: "test"
+            AUTH_SECRET_KEY: "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e"
         run: |
-          pytest tests/ -v
+            pytest tests/ -v
+
+  docker-compose-deployment:
+    name: Docker Compose Deployment & Health Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose Configuration
+        run: |
+          docker compose config
+
+      - name: Build Docker Images
+        run: |
+          docker compose build
+
+      - name: Verify Redis Port 6379 Is Not Publicly Published
+        run: |
+          # Ensure docker-compose.yml does not bind Redis port 6379 to host interfaces
+          PUBLISHED_PORTS=$(docker compose config | grep -E "published: ['\"]?6379" || true)
+          if [ -n "$PUBLISHED_PORTS" ]; then
+            echo "SECURITY ERROR: Redis port 6379 is published publicly to host!"
+            exit 1
+          fi
+          echo "VERIFIED: Redis port 6379 is strictly isolated to internal container network."
+
+      - name: Verify Fail-Closed Prevention of API Startup on Incorrect Redis Password
+        run: |
+          # Generate test environment with password-protected Redis
+          cat << 'EOF' > .env.badauth
+          ENVIRONMENT=production
+          AUTH_SECRET_KEY=c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e
+          ADMIN_API_KEY=test-admin-secret-at-least-32-chars-long-12345
+          METRICS_API_KEY=test-metrics-secret-at-least-32-chars-12345
+          REDIS_PASSWORD=correct_redis_auth_token_32_chars_12345
+          REDIS_AUTH_REQUIRED=true
+          REQUIRE_AUTH=true
+          PROTECT_METRICS=true
+          RATE_LIMITER_FAILURE_MODE=fail_closed
+          EOF
+
+          # Start Redis with authentication
+          docker compose --env-file .env.badauth up -d redis
+
+          # Wait for Redis healthcheck
+          for i in $(seq 1 15); do
+            HEALTH=$(docker inspect --format='{{json .State.Health.Status}}' rate_limiter_redis 2>/dev/null || echo '"starting"')
+            if [ "$HEALTH" = '"healthy"' ]; then
+              echo "Redis is healthy."
+              break
+            fi
+            sleep 2
+          done
+
+          # Verify API container fails fast on incorrect password
+          echo "Verifying API fails fast with bad Redis credentials..."
+          set +e
+          docker run --rm \
+            --network ratelimiter_rate_limiter_net \
+            -e ENVIRONMENT=production \
+            -e AUTH_SECRET_KEY=c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e \
+            -e ADMIN_API_KEY=test-admin-secret-at-least-32-chars-long-12345 \
+            -e REDIS_URL=redis://rate_limiter_redis:6379 \
+            -e REDIS_PASSWORD=wrong_password_attempt_32_chars_long \
+            -e RATE_LIMITER_FAILURE_MODE=fail_closed \
+            ratelimiter-api:latest
+          EXIT_CODE=$?
+          set -e
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "SECURITY ERROR: API started successfully despite invalid Redis password!"
+            exit 1
+          fi
+          echo "VERIFIED: API container exited with code $EXIT_CODE under fail-closed mode."
+
+          # Clean up badauth container state
+          docker compose --env-file .env.badauth down -v
+          rm -f .env.badauth
+
+      - name: Launch Full-Stack Production Deployment With Authenticated Redis
+        run: |
+          cat << 'EOF' > .env.deploy
+          ENVIRONMENT=production
+          AUTH_SECRET_KEY=c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e
+          ADMIN_API_KEY=test-admin-secret-at-least-32-chars-long-12345
+          METRICS_API_KEY=test-metrics-secret-at-least-32-chars-12345
+          REDIS_PASSWORD=correct_redis_auth_token_32_chars_12345
+          REDIS_AUTH_REQUIRED=true
+          REQUIRE_AUTH=true
+          PROTECT_METRICS=true
+          RATE_LIMITER_FAILURE_MODE=fail_closed
+          EOF
+
+          docker compose --env-file .env.deploy up -d
+
+          # Wait for API to report healthy
+          for i in $(seq 1 20); do
+            HEALTH=$(docker inspect --format='{{json .State.Health.Status}}' rate_limiter_api 2>/dev/null || echo '"starting"')
+            if [ "$HEALTH" = '"healthy"' ]; then
+              echo "API is healthy."
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Verify Redis Port Isolation and API Health Endpoint
+        run: |
+          # 1. Verify port 6379 is not bound on host
+          if nc -z 127.0.0.1 6379 2>/dev/null; then
+            echo "SECURITY ERROR: Redis port 6379 is open on host 127.0.0.1!"
+            exit 1
+          fi
+          echo "VERIFIED: Host cannot connect to Redis port 6379 directly."
+
+          # 2. Verify API health endpoint
+          RESPONSE=$(curl -fsS http://127.0.0.1:8000/)
+          echo "API Response: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"redis_connected":true' || echo "$RESPONSE" | grep -q '"redis_connected": true'
+          echo "VERIFIED: API is healthy and connected to authenticated Redis."
+
+      - name: Clean Up Docker Compose Resources
+        if: always()
+        run: |
+          docker compose --env-file .env.deploy down -v 2>/dev/null || true
+          docker compose down -v 2>/dev/null || true
+          rm -f .env.deploy .env.badauth
 

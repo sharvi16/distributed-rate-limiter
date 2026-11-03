@@ -608,6 +608,49 @@ class TestRedisAuthenticationIntegration:
             except Exception:
                 pass
 
+    def test_preserve_redis_password_leading_trailing_whitespace_initialization(self, monkeypatch):
+        """
+        Verifies that passwords containing leading and trailing spaces or special characters
+        are preserved intact without destructive .strip() across RateLimiter, main.py,
+        and sync_rate_limiter_configuration(), and only an empty string is treated as unset.
+        """
+        secret_with_spaces = "   secret_with_surrounding_spaces_123   "
+
+        # 1. RateLimiter direct initialization preserves whitespace
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password=secret_with_spaces,
+            failure_mode=FailureMode.LOCAL_FALLBACK
+        )
+        assert limiter.redis_password == secret_with_spaces
+        assert limiter.redis_password.startswith("   ")
+        assert limiter.redis_password.endswith("   ")
+
+        # 2. URL-embedded and environment credentials with whitespace match without false contradiction
+        encoded_pwd = urllib.parse.quote(secret_with_spaces, safe="")
+        url_with_spaces = f"redis://:{encoded_pwd}@localhost:6379/0"
+        limiter_url = RateLimiter(
+            redis_url=url_with_spaces,
+            redis_password=secret_with_spaces,
+            failure_mode=FailureMode.LOCAL_FALLBACK
+        )
+        assert limiter_url.redis_password == secret_with_spaces
+
+        # 3. Application initialization and lifespan sync in main.py preserves whitespace
+        monkeypatch.setenv("REDIS_PASSWORD", secret_with_spaces)
+        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+        main.sync_rate_limiter_configuration()
+        assert main.limiter.redis_password == secret_with_spaces
+        assert main.ip_limiter.redis_password == secret_with_spaces
+
+        # 4. Empty string is treated as unset password (None)
+        limiter_empty = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password="",
+            failure_mode=FailureMode.LOCAL_FALLBACK
+        )
+        assert limiter_empty.redis_password is None
+
 
 # =============================================================================
 # 5. Redis Startup Validation
@@ -783,7 +826,114 @@ class TestRedisStartupValidation:
 
 
 # =============================================================================
-# 6. Redis Startup Connectivity & PING Verification
+# 6. Redis Client mTLS & SSL Runtime Configuration
+# =============================================================================
+
+class TestRedisClientMTLSConfiguration:
+    """Verifies that redis-py client is genuinely configured with SSLConnection and mTLS certificates."""
+
+    def test_redis_client_configured_with_genuine_ssl_connection_and_certificates(self):
+        """RateLimiter creates SSLConnection with exact client cert, private key, and CA bundle."""
+        with tempfile.NamedTemporaryFile() as cert, tempfile.NamedTemporaryFile() as key, tempfile.NamedTemporaryFile() as ca:
+            limiter = RateLimiter(
+                redis_url="rediss://localhost:6379/0",
+                ssl_certfile=cert.name,
+                ssl_keyfile=key.name,
+                ssl_ca_certs=ca.name,
+                failure_mode=FailureMode.LOCAL_FALLBACK
+            )
+            assert limiter.redis is not None
+            assert limiter.redis.connection_pool.connection_class is redis.connection.SSLConnection
+            conn_kwargs = limiter.redis.connection_pool.connection_kwargs
+            assert conn_kwargs["ssl_certfile"] == cert.name
+            assert conn_kwargs["ssl_keyfile"] == key.name
+            assert conn_kwargs["ssl_ca_certs"] == ca.name
+            assert conn_kwargs["ssl_cert_reqs"] == "required"
+            assert conn_kwargs["ssl_check_hostname"] is True
+
+    def test_redis_client_configure_transactionally_updates_ssl_parameters(self):
+        """RateLimiter.configure() updates client SSL certificate settings transactionally."""
+        with tempfile.NamedTemporaryFile() as cert1, tempfile.NamedTemporaryFile() as key1, tempfile.NamedTemporaryFile() as ca1, \
+             tempfile.NamedTemporaryFile() as cert2, tempfile.NamedTemporaryFile() as key2, tempfile.NamedTemporaryFile() as ca2:
+            limiter = RateLimiter(
+                redis_url="rediss://localhost:6379/0",
+                ssl_certfile=cert1.name,
+                ssl_keyfile=key1.name,
+                ssl_ca_certs=ca1.name,
+                failure_mode=FailureMode.LOCAL_FALLBACK
+            )
+            assert limiter.redis.connection_pool.connection_kwargs["ssl_certfile"] == cert1.name
+
+            # Transactionally reconfigure with second certificate set
+            limiter.configure(
+                ssl_certfile=cert2.name,
+                ssl_keyfile=key2.name,
+                ssl_ca_certs=ca2.name
+            )
+            assert limiter.redis.connection_pool.connection_class is redis.connection.SSLConnection
+            conn_kwargs = limiter.redis.connection_pool.connection_kwargs
+            assert conn_kwargs["ssl_certfile"] == cert2.name
+            assert conn_kwargs["ssl_keyfile"] == key2.name
+            assert conn_kwargs["ssl_ca_certs"] == ca2.name
+
+    def test_plain_redis_url_rejects_ssl_parameters_in_client(self):
+        """RateLimiter strictly rejects using SSL/mTLS parameters with plain redis:// scheme."""
+        with tempfile.NamedTemporaryFile() as cert, tempfile.NamedTemporaryFile() as key:
+            with pytest.raises(ValueError, match="plain 'redis://' connection scheme cannot claim TLS"):
+                RateLimiter(
+                    redis_url="redis://localhost:6379/0",
+                    ssl_certfile=cert.name,
+                    ssl_keyfile=key.name,
+                    failure_mode=FailureMode.LOCAL_FALLBACK
+                )
+
+    def test_redis_ssl_true_cannot_claim_tls_with_plain_scheme(self, monkeypatch):
+        """REDIS_SSL=true cannot claim TLS while using a plain redis:// connection."""
+        monkeypatch.setenv("REDIS_SSL", "true")
+        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+
+        # Startup validation rejects
+        with pytest.raises(ValueError, match="REDIS_SSL=true cannot claim TLS while using a plain 'redis://' connection scheme"):
+            validate_auth_configuration()
+
+        # RateLimiter rejects
+        with pytest.raises(ValueError, match="plain 'redis://' connection scheme cannot claim TLS"):
+            RateLimiter(
+                redis_url="redis://localhost:6379/0",
+                failure_mode=FailureMode.LOCAL_FALLBACK
+            )
+
+    def test_mtls_requires_both_cert_and_key_in_client(self):
+        """Configuring mTLS on rediss:// without private key fails fast."""
+        with tempfile.NamedTemporaryFile() as cert:
+            with pytest.raises(ValueError, match="mTLS configuration requires both ssl_certfile and ssl_keyfile"):
+                RateLimiter(
+                    redis_url="rediss://localhost:6379/0",
+                    ssl_certfile=cert.name,
+                    ssl_keyfile=None,
+                    failure_mode=FailureMode.LOCAL_FALLBACK
+                )
+
+    def test_application_lifespan_syncs_mtls_configuration_to_client(self, monkeypatch):
+        """FastAPI lifespan configuration sync propagates mTLS certificates to application limiters."""
+        with tempfile.NamedTemporaryFile() as cert, tempfile.NamedTemporaryFile() as key, tempfile.NamedTemporaryFile() as ca:
+            monkeypatch.setenv("REDIS_URL", "rediss://localhost:6379/0")
+            monkeypatch.setenv("REDIS_SSL_CERTFILE", cert.name)
+            monkeypatch.setenv("REDIS_SSL_KEYFILE", key.name)
+            monkeypatch.setenv("REDIS_SSL_CA_CERTS", ca.name)
+
+            main.sync_rate_limiter_configuration()
+
+            assert main.limiter.redis.connection_pool.connection_class is redis.connection.SSLConnection
+            conn_kwargs = main.limiter.redis.connection_pool.connection_kwargs
+            assert conn_kwargs["ssl_certfile"] == cert.name
+            assert conn_kwargs["ssl_keyfile"] == key.name
+            assert conn_kwargs["ssl_ca_certs"] == ca.name
+            assert main.ip_limiter.redis.connection_pool.connection_kwargs["ssl_certfile"] == cert.name
+
+
+# =============================================================================
+# 7. Redis Startup Connectivity & PING Verification
 # =============================================================================
 
 class TestRedisStartupConnectivityCheck:

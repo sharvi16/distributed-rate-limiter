@@ -20,7 +20,19 @@ def reset_global_rate_limiters():
     yield
     try:
         import main
-        main.limiter.configure(redis_url="redis://localhost:6379", redis_password=None)
-        main.ip_limiter.configure(redis_url="redis://localhost:6379", redis_password=None)
+        main.limiter.configure(
+            redis_url="redis://localhost:6379",
+            redis_password=None,
+            ssl_certfile=None,
+            ssl_keyfile=None,
+            ssl_ca_certs=None
+        )
+        main.ip_limiter.configure(
+            redis_url="redis://localhost:6379",
+            redis_password=None,
+            ssl_certfile=None,
+            ssl_keyfile=None,
+            ssl_ca_certs=None
+        )
     except Exception:
         pass
