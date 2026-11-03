@@ -141,9 +141,14 @@ The application exposes real-time telemetry at `GET /metrics` in Prometheus text
 ## 🔒 Administrative Endpoint Security
 
 The diagnostic endpoint `GET /model-stats` exposes active model centroids, evaluation counters, and jailed users.
-- In production, set `ADMIN_API_KEY` in your environment.
-- When configured, requests require the `x-admin-key: <ADMIN_API_KEY>` header (returns `401 Unauthorized` if invalid or missing).
-- If `ADMIN_API_KEY` is empty (default dev mode), open access is allowed for convenient inspection.
+- **Fail-Closed Protection**: Access is strictly denied (HTTP 401 Unauthorized) if `ADMIN_API_KEY` is missing, empty, or incorrect. Unauthenticated public access is NEVER permitted in any environment.
+- **Constant-Time Comparison**: Credentials submitted via `x-admin-key: <ADMIN_API_KEY>` are verified using `hmac.compare_digest` to prevent side-channel timing attacks.
+- **Production Startup Enforcement**: In production (`ENVIRONMENT=production` or default), `ADMIN_API_KEY` is mandatory (minimum 32 characters, Shannon entropy $\ge 3.0$ bits/symbol, minimum 10 unique symbols). Missing or weak keys immediately halt process launch.
+- **Error Neutrality**: Response error messages (`Unauthorized: invalid or missing admin credentials.`) do not leak whether the key is missing from server configuration or mismatched.
+- Generate a cryptographically secure key with:
+  ```bash
+  python -c "import secrets; print(secrets.token_hex(32))"
+  ```
 
 ---
 
@@ -195,13 +200,14 @@ The stack launches:
 
 ## 🧪 Comprehensive Automated Test Suite
 
-The test suite contains **94 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
+The test suite contains **106 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
 
 ```bash
 pytest tests/ -v
 ```
 
 ### Test Categories:
+- **`tests/security/test_admin_protection.py`** (12 tests): Admin key enforcement (fail-closed, missing/empty key denial, invalid key denial, valid key acceptance, constant-time comparison, error neutrality, production startup validation for existence/length/entropy/placeholders).
 - **`tests/security/test_priority1_audit.py`** (43 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy (Shannon entropy & diversity vs length), known placeholder blocklist, strict boolean configuration parsing, startup configuration validation through FastAPI lifespan, production vs development environment isolation, prohibition of unauthenticated headers in production, and identity anti-spoofing.
 - **`tests/unit/test_token_bucket.py`** (11 tests): Capacity, refill math, oversized requests, atomic concurrency, failure modes (`fail_closed`, `fail_open`, `local_fallback`), and RFC headers.
 - **`tests/unit/test_challenge.py`** (8 tests): Cryptographic ID generation, single-use enforcement, attempt exhaustion, user-session binding, and answer leak prevention.

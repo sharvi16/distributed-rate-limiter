@@ -2,6 +2,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi import FastAPI, Header, HTTPException, status, Request, Response, Depends
 from contextlib import asynccontextmanager
 import math
+import hmac
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import os
@@ -68,14 +69,29 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
 
 def verify_admin_key(x_admin_key: Optional[str] = Header(None, alias="x-admin-key")) -> bool:
-    """Protects internal model diagnostics and metrics from unauthorized inspection."""
-    if not ADMIN_API_KEY:
-        return True
-    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
+    """
+    Protects internal model diagnostics and metrics from unauthorized inspection.
+
+    Security Rules:
+      1. Missing or empty ADMIN_API_KEY configuration NEVER grants access (fail-closed).
+      2. Missing or incorrect 'x-admin-key' header returns HTTP 401 Unauthorized.
+      3. Uses constant-time comparison (hmac.compare_digest) to prevent timing attacks.
+      4. Does not leak whether the key is missing from server configuration or mismatched.
+      5. The actual key is never logged.
+    """
+    configured_key = os.getenv("ADMIN_API_KEY", "").strip() or globals().get("ADMIN_API_KEY", "").strip()
+    if not configured_key or not x_admin_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: invalid or missing 'x-admin-key' header."
+            detail="Unauthorized: invalid or missing admin credentials."
         )
+
+    if not hmac.compare_digest(x_admin_key.strip(), configured_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: invalid or missing admin credentials."
+        )
+
     return True
 
 # -----------------------------------------------------------------------------
@@ -100,7 +116,7 @@ def root():
         "endpoints": {
             "GET /limited-resource": "Protected resource with adaptive spam & rate limit evaluation",
             "POST /verify-challenge": "Verify challenge for suspicious users (triggers model self-learning)",
-            "GET /model-stats": "Inspect learned model centroids and spam vs human metrics",
+            "GET /model-stats": "Inspect learned model centroids and spam vs human metrics (Admin)",
             "GET /docs": "Interactive Swagger UI",
             "GET /metrics": "Prometheus metrics exposition"
         }
@@ -360,6 +376,7 @@ def model_stats(authorized: bool = Depends(verify_admin_key)):
     """
     Inspect the live state of the self-learning spam detection engine,
     including learned centroids and evaluation metrics.
+    Protected strictly by verify_admin_key with constant-time HMAC comparison.
     """
     diagnostics = detector.get_diagnostics()
     diagnostics["redis_connected"] = limiter.is_redis_active()

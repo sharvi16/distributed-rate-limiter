@@ -9,9 +9,10 @@ Provides strict HMAC-SHA256 signed bearer token authentication with:
   - Secure-by-default production enforcement (REQUIRE_AUTH=true default, ENVIRONMENT=production default).
   - Strict prohibition of unauthenticated client-provided identity headers in production.
   - Strict boolean environment variable parsing (typos like 'treu' raise errors, never silently bypass).
-  - Cryptographic entropy validation on AUTH_SECRET_KEY (minimum 32 bytes / 256 bits of random material,
+  - Cryptographic entropy validation on AUTH_SECRET_KEY and ADMIN_API_KEY (minimum 32 bytes / 256 bits,
     Shannon entropy >= 3.0 bits/symbol, minimum 10 unique symbols, blocklist for known placeholders).
   - Startup-time configuration validation via validate_auth_configuration() and FastAPI lifespan.
+  - Fail-closed administrative protection: unauthenticated public access to diagnostics is strictly prohibited.
 """
 
 import os
@@ -184,9 +185,63 @@ def get_auth_secret_key() -> str:
     return key
 
 
+def validate_admin_configuration() -> None:
+    """
+    Validates admin API key security configuration during application startup.
+
+    Security Rules:
+      - In production (ENVIRONMENT=production or default):
+        * ADMIN_API_KEY must be configured (RuntimeError if missing or empty).
+        * ADMIN_API_KEY must not be in KNOWN_INSECURE_SECRETS (ValueError).
+        * ADMIN_API_KEY must have at least 32 characters / 256 bits (ValueError).
+        * ADMIN_API_KEY must meet entropy requirements: Shannon entropy >= 3.0 bits/symbol
+          and at least 10 unique symbols (ValueError).
+      - In development/test:
+        * If ADMIN_API_KEY is configured, it is validated against known placeholders.
+        * If omitted or empty in dev/test, access to admin endpoints remains strictly denied
+          (fail-closed: never silently allows public access).
+      - Never logs admin keys.
+    """
+    key = os.getenv("ADMIN_API_KEY", "").strip()
+
+    if is_production_env():
+        if not key:
+            raise RuntimeError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: ADMIN_API_KEY environment variable is not configured. "
+                "A cryptographically strong admin key (at least 32 bytes / 256 bits of securely generated random material) is mandatory in production. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+
+        if key in KNOWN_INSECURE_SECRETS:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: ADMIN_API_KEY is configured with a known insecure placeholder or example value. "
+                "Generate a unique secret with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+
+        if len(key) < 32:
+            raise ValueError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: ADMIN_API_KEY has insufficient length "
+                f"({len(key)} characters). Minimum required length is 32 characters (256 bits)."
+            )
+
+        unique_chars = len(set(key))
+        entropy = calculate_shannon_entropy(key)
+        if unique_chars < 10 or entropy < 3.0:
+            raise ValueError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: ADMIN_API_KEY has insufficient cryptographic entropy "
+                f"(entropy: {entropy:.2f} bits/symbol, unique chars: {unique_chars}). "
+                "Length alone is not entropy. Secret must be securely generated random material (e.g. python -c \"import secrets; print(secrets.token_hex(32))\")."
+            )
+    else:
+        if key and key in KNOWN_INSECURE_SECRETS:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: ADMIN_API_KEY is configured with a known insecure placeholder."
+            )
+
+
 def validate_auth_configuration() -> None:
     """
-    Validates all authentication security configurations at application startup.
+    Validates all authentication and admin security configurations at application startup.
     Executed during FastAPI lifespan / startup initialization.
     
     Aborts startup immediately if:
@@ -196,6 +251,7 @@ def validate_auth_configuration() -> None:
         * REQUIRE_AUTH is set to false.
         * ALLOW_UNAUTHENTICATED_DEV_HEADERS is set to true.
         * AUTH_SECRET_KEY is missing, weak (< 32 chars), low-entropy (< 3.0 bits or < 10 unique symbols), or a known placeholder.
+        * ADMIN_API_KEY is missing, weak, low-entropy, or a known placeholder.
     """
     # 1. Validate boolean configurations (throws ValueError on invalid formats like 'treu')
     req_auth = is_auth_required()
@@ -224,8 +280,11 @@ def validate_auth_configuration() -> None:
                 "Unauthenticated client-provided identity headers are strictly prohibited in production."
             )
 
-    # 4. Validate secret key (throws RuntimeError if missing, ValueError if weak/low-entropy/placeholder)
+    # 4. Validate bearer token secret key (throws RuntimeError if missing, ValueError if weak/low-entropy/placeholder)
     get_auth_secret_key()
+
+    # 5. Validate admin diagnostic endpoint security configuration
+    validate_admin_configuration()
 
 
 @dataclass

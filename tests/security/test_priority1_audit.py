@@ -406,6 +406,7 @@ class TestStartupConfigurationValidation:
         monkeypatch.setenv("REQUIRE_AUTH", "true")
         monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
         monkeypatch.setenv("AUTH_SECRET_KEY", secrets.token_hex(32))
+        monkeypatch.setenv("ADMIN_API_KEY", secrets.token_hex(32))
 
         # Must run to completion without raising
         validate_auth_configuration()
@@ -483,6 +484,7 @@ class TestProductionDevHeaderProhibitionAndEnvironmentIsolation:
         valid_key = secrets.token_hex(32)
         monkeypatch.setenv("ENVIRONMENT", "production")
         monkeypatch.setenv("AUTH_SECRET_KEY", valid_key)
+        monkeypatch.setenv("ADMIN_API_KEY", valid_key)
 
         # Combo 1: (False, False) -> Rejected
         monkeypatch.setenv("REQUIRE_AUTH", "false")
@@ -562,6 +564,7 @@ class TestProductionDevHeaderProhibitionAndEnvironmentIsolation:
     def test_production_startup_rejects_every_insecure_configuration(self, monkeypatch):
         """FastAPI lifespan aborts startup on any insecure configuration in production."""
         monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("ADMIN_API_KEY", secrets.token_hex(32))
 
         # 1. Missing secret key
         monkeypatch.setenv("REQUIRE_AUTH", "true")
