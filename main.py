@@ -1,5 +1,6 @@
 from fastapi.responses import PlainTextResponse
 from fastapi import FastAPI, Header, HTTPException, status, Request, Response, Depends
+from contextlib import asynccontextmanager
 import math
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -9,13 +10,26 @@ import redis
 from rate_limiter import RateLimiter, FailureMode, RedisUnavailableError
 from spam_detector import AdaptiveSpamDetector
 from ip_utils import resolve_client_ip, parse_trusted_proxies
-from auth import get_authenticated_principal, AuthenticatedPrincipal
+from auth import get_authenticated_principal, AuthenticatedPrincipal, validate_auth_configuration
 from metrics import metrics_collector
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan handler executing startup configuration validation.
+    Ensures authentication, encryption keys, and environment variables are
+    verified before accepting incoming HTTP requests.
+    """
+    validate_auth_configuration()
+    yield
+
 
 app = FastAPI(
     title="Distributed Rate Limiter with Self-Learning Spam Detection",
     description="Adaptive rate limiting using Token Bucket algorithm, Behavioral Feature Extraction, and Online Self-Learning Anomaly Detection.",
-    version="2.0.0"
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 # -----------------------------------------------------------------------------
@@ -91,11 +105,12 @@ def root():
             "GET /metrics": "Prometheus metrics exposition"
         }
     }
+
+
 @app.get("/metrics", response_class=PlainTextResponse)
 def get_metrics():
     """Exposes system telemetry, request counters, and cluster health in Prometheus exposition format."""
     return metrics_collector.generate_prometheus_output(limiter=limiter, detector=detector)
-
 
 
 @app.get("/limited-resource")

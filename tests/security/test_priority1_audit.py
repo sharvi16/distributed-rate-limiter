@@ -5,14 +5,17 @@ Covers:
   1. Redis failure modes at the API level (FAIL_CLOSED, FAIL_OPEN, LOCAL_FALLBACK).
   2. Challenge session binding (omitted identities, mismatched users, replay attacks) in Redis and local fallback.
   3. Cryptographic token verification (rejection of usr_*, token_*, arbitrary strings, tampered signatures, expired, future).
-  4. Signing secret entropy and strict production validation (missing/weak key rejection).
-  5. Production authentication defaults (REQUIRE_AUTH=true, 401 rejection, dev header lockdown).
-  6. Identity trust & anti-spoofing across both /limited-resource and /verify-challenge endpoints.
-  7. Device fingerprinting limitations: verifying header-derived heuristic nature.
+  4. Signing secret entropy, length vs entropy distinction, and known placeholder blocklist.
+  5. Strict boolean environment configuration validation (typos like 'treu' fail startup).
+  6. Startup-time configuration validation via validate_auth_configuration() and FastAPI lifespan.
+  7. Production authentication defaults (REQUIRE_AUTH=true, 401 rejection, dev header lockdown).
+  8. Identity trust & anti-spoofing across both /limited-resource and /verify-challenge endpoints.
+  9. Device fingerprinting limitations: verifying header-derived heuristic nature.
 """
 
 import time
 import uuid
+import secrets
 import pytest
 from fastapi.testclient import TestClient
 
@@ -26,6 +29,9 @@ from auth import (
     get_auth_secret_key,
     is_auth_required,
     is_dev_headers_allowed,
+    parse_bool_env,
+    calculate_shannon_entropy,
+    validate_auth_configuration,
     AuthenticatedPrincipal
 )
 
@@ -288,7 +294,7 @@ class TestCryptographicTokenVerification:
 
 
 # =============================================================================
-# 4. Signing Secret Security, Entropy & Startup Validation
+# 4. Signing Secret Security, Entropy vs Length & Blocklist
 # =============================================================================
 class TestSigningSecretSecurityAndEntropy:
     def test_missing_signing_secret_in_production_raises_runtime_error(self, monkeypatch):
@@ -303,7 +309,7 @@ class TestSigningSecretSecurityAndEntropy:
         assert "CRITICAL SECURITY CONFIGURATION ERROR" in str(exc_info.value)
         assert "AUTH_SECRET_KEY" in str(exc_info.value)
 
-    def test_weak_signing_secret_in_production_raises_value_error(self, monkeypatch):
+    def test_weak_signing_secret_length_raises_value_error(self, monkeypatch):
         """In production environment, an AUTH_SECRET_KEY shorter than 32 characters must raise ValueError."""
         monkeypatch.setenv("ENVIRONMENT", "production")
         monkeypatch.setenv("REQUIRE_AUTH", "true")
@@ -315,15 +321,130 @@ class TestSigningSecretSecurityAndEntropy:
         assert "insufficient length" in str(exc_info.value)
         assert "Minimum required length is 32 characters" in str(exc_info.value)
 
-    def test_strong_signing_secret_accepted(self, monkeypatch):
-        """A 32+ character key is valid and accepted."""
-        strong_key = "x" * 32
+    def test_low_entropy_signing_secret_rejected(self, monkeypatch):
+        """Length alone is not entropy. Repeating characters like 'x' * 32 must be rejected in production."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
+
+        # 'x' * 32 has 0 entropy and only 1 unique character
+        monkeypatch.setenv("AUTH_SECRET_KEY", "x" * 32)
+        with pytest.raises(ValueError) as exc_info:
+            get_auth_secret_key()
+        assert "insufficient cryptographic entropy" in str(exc_info.value)
+        assert "Length alone is not entropy" in str(exc_info.value)
+
+        # Alternating 2 characters (e.g. '01' * 16) has only 1.0 bit entropy and 2 unique characters
+        monkeypatch.setenv("AUTH_SECRET_KEY", "01" * 16)
+        with pytest.raises(ValueError) as exc_info:
+            get_auth_secret_key()
+        assert "insufficient cryptographic entropy" in str(exc_info.value)
+
+    def test_known_insecure_placeholder_rejected(self, monkeypatch):
+        """Publicly known placeholder strings from documentation must be explicitly rejected."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
+
+        placeholder = "replace-with-a-secure-random-secret-key-at-least-32-chars-long"
+        monkeypatch.setenv("AUTH_SECRET_KEY", placeholder)
+        with pytest.raises(ValueError) as exc_info:
+            get_auth_secret_key()
+        assert "known insecure placeholder" in str(exc_info.value)
+
+    def test_strong_random_signing_secret_accepted(self, monkeypatch):
+        """A cryptographically random 256-bit key (e.g. 64 hex characters) is valid and accepted."""
+        strong_key = secrets.token_hex(32)
         monkeypatch.setenv("AUTH_SECRET_KEY", strong_key)
         assert get_auth_secret_key() == strong_key
 
 
 # =============================================================================
-# 5. Production Authentication Defaults & Endpoint Enforcement
+# 5. Strict Boolean Configuration Parsing (Anti-Typo)
+# =============================================================================
+class TestStrictBooleanConfiguration:
+    def test_valid_boolean_values(self):
+        """Standard truthy and falsy values are parsed correctly."""
+        for truthy in ("true", "True", "TRUE", "1", "yes", "YES", "on"):
+            import os
+            os.environ["_TEST_BOOL"] = truthy
+            assert parse_bool_env("_TEST_BOOL", default=False) is True
+
+        for falsy in ("false", "False", "FALSE", "0", "no", "NO", "off"):
+            os.environ["_TEST_BOOL"] = falsy
+            assert parse_bool_env("_TEST_BOOL", default=True) is False
+
+    def test_invalid_require_auth_typo_raises_value_error(self, monkeypatch):
+        """Typo 'REQUIRE_AUTH=treu' must raise ValueError, never silently disable authentication."""
+        monkeypatch.setenv("REQUIRE_AUTH", "treu")
+        with pytest.raises(ValueError) as exc_info:
+            is_auth_required()
+        assert "Invalid boolean value" in str(exc_info.value)
+        assert "treu" in str(exc_info.value)
+
+    def test_invalid_dev_headers_typo_raises_value_error(self, monkeypatch):
+        """Typo in ALLOW_UNAUTHENTICATED_DEV_HEADERS must raise ValueError."""
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "fals")
+        with pytest.raises(ValueError) as exc_info:
+            is_dev_headers_allowed()
+        assert "Invalid boolean value" in str(exc_info.value)
+        assert "fals" in str(exc_info.value)
+
+
+# =============================================================================
+# 6. Startup-Time Configuration Validation & Lifespan
+# =============================================================================
+class TestStartupConfigurationValidation:
+    def test_startup_validation_succeeds_in_valid_production(self, monkeypatch):
+        """validate_auth_configuration() succeeds when production configuration is fully valid."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
+        monkeypatch.setenv("AUTH_SECRET_KEY", secrets.token_hex(32))
+
+        # Must run to completion without raising
+        validate_auth_configuration()
+
+    def test_startup_validation_fails_on_missing_secret_in_prod(self, monkeypatch):
+        """validate_auth_configuration() raises RuntimeError on missing AUTH_SECRET_KEY in production."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
+        monkeypatch.setenv("AUTH_SECRET_KEY", "")
+
+        with pytest.raises(RuntimeError):
+            validate_auth_configuration()
+
+    def test_startup_validation_fails_on_low_entropy_secret_in_prod(self, monkeypatch):
+        """validate_auth_configuration() raises ValueError on low-entropy key in production."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
+        monkeypatch.setenv("AUTH_SECRET_KEY", "x" * 32)
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_auth_configuration()
+        assert "insufficient cryptographic entropy" in str(exc_info.value)
+
+    def test_startup_validation_fails_on_typo(self, monkeypatch):
+        """validate_auth_configuration() raises ValueError when REQUIRE_AUTH has a typo."""
+        monkeypatch.setenv("REQUIRE_AUTH", "treu")
+        with pytest.raises(ValueError):
+            validate_auth_configuration()
+
+    def test_fastapi_lifespan_executes_startup_validation(self, monkeypatch):
+        """FastAPI lifespan context executes validate_auth_configuration on startup."""
+        monkeypatch.setenv("REQUIRE_AUTH", "treu")
+        # TestClient entered as a context manager runs the app lifespan
+        with pytest.raises(ValueError) as exc_info:
+            with TestClient(app):
+                pass
+        assert "Invalid boolean value" in str(exc_info.value)
+
+
+# =============================================================================
+# 7. Production Authentication Defaults & Endpoint Enforcement
 # =============================================================================
 class TestProductionAuthDefaultsAndEndpointEnforcement:
     def test_default_production_auth_requirement(self, monkeypatch):
@@ -415,7 +536,7 @@ class TestProductionAuthDefaultsAndEndpointEnforcement:
 
 
 # =============================================================================
-# 6. Device Fingerprint Heuristic Verification
+# 8. Device Fingerprint Heuristic Verification
 # =============================================================================
 class TestDeviceFingerprintHeuristicLimitations:
     def test_fingerprint_changes_with_untrusted_client_headers(self):

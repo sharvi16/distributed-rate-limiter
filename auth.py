@@ -7,14 +7,19 @@ Provides strict HMAC-SHA256 signed bearer token authentication with:
   - Clock-skew window validation for future timestamps.
   - Zero support for forged or unsigned plaintext tokens (e.g. token_*, usr_*).
   - Secure-by-default production enforcement (REQUIRE_AUTH=true default).
-  - Cryptographic entropy validation on AUTH_SECRET_KEY (minimum 32 characters / 256 bits).
+  - Strict boolean environment variable parsing (typos like 'treu' raise errors, never silently bypass).
+  - Cryptographic entropy validation on AUTH_SECRET_KEY (minimum 32 bytes / 256 bits of random material,
+    Shannon entropy >= 3.0 bits/symbol, minimum 10 unique symbols, blocklist for known placeholders).
+  - Startup-time configuration validation via validate_auth_configuration() and FastAPI lifespan.
 """
 
 import os
+import math
 import hmac
 import hashlib
 import time
 import secrets
+from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
 from fastapi import Request, Header, HTTPException, status
@@ -23,16 +28,60 @@ from fastapi import Request, Header, HTTPException, status
 # Ephemeral in-memory fallback ONLY used in explicit dev/test environments if AUTH_SECRET_KEY is omitted
 _EPHEMERAL_DEV_KEY = secrets.token_hex(32)
 
+# Blocklist of known public placeholders and example secrets that must never be used in production
+KNOWN_INSECURE_SECRETS = {
+    "replace-with-a-secure-random-secret-key-at-least-32-chars-long",
+    "rate-limiter-default-secret-key-change-in-prod",
+    "change-me-in-production-secret-key-min-32-chars",
+    "test-secret-key-with-sufficient-length-32-characters",
+}
+
+
+def calculate_shannon_entropy(data: str) -> float:
+    """
+    Computes the Shannon entropy (in bits per symbol) of a string.
+    H(X) = -sum(p(x) * log2(p(x)))
+    """
+    if not data:
+        return 0.0
+    counts = Counter(data)
+    total = len(data)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def parse_bool_env(var_name: str, default: bool) -> bool:
+    """
+    Parses a boolean environment variable strictly.
+    
+    Accepts:
+      - Truthy: 'true', '1', 'yes', 'on'
+      - Falsy: 'false', '0', 'no', 'off'
+      - Unset / empty: returns `default`
+    
+    Raises:
+      - ValueError if the value is non-empty and not recognized (prevents typos from bypassing security).
+    """
+    val = os.getenv(var_name)
+    if val is None or val.strip() == "":
+        return default
+    clean = val.strip().lower()
+    if clean in ("true", "1", "yes", "on"):
+        return True
+    if clean in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(
+        f"CRITICAL SECURITY CONFIGURATION ERROR: Invalid boolean value for environment variable '{var_name}': {val!r}. "
+        "Allowed values are 'true', 'false', '1', '0', 'yes', 'no'. Typos must not silently disable security."
+    )
+
 
 def is_auth_required() -> bool:
     """
     Returns True if authentication is strictly required (default in production).
     Can only be disabled by explicitly setting REQUIRE_AUTH=false in environment.
+    Strictly validates boolean format and raises ValueError on typos.
     """
-    val = os.getenv("REQUIRE_AUTH")
-    if val is None:
-        return True  # Secure default
-    return val.strip().lower() in ("true", "1", "yes")
+    return parse_bool_env("REQUIRE_AUTH", default=True)
 
 
 def is_dev_headers_allowed() -> bool:
@@ -40,11 +89,12 @@ def is_dev_headers_allowed() -> bool:
     Returns True only when unauthenticated client-provided 'user-id' headers are
     explicitly permitted via ALLOW_UNAUTHENTICATED_DEV_HEADERS=true AND REQUIRE_AUTH=false.
     Never silently enabled in production.
+    Strictly validates boolean format and raises ValueError on typos.
     """
+    dev_allowed = parse_bool_env("ALLOW_UNAUTHENTICATED_DEV_HEADERS", default=False)
     if is_auth_required():
         return False
-    val = os.getenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
-    return val.strip().lower() in ("true", "1", "yes")
+    return dev_allowed
 
 
 def get_auth_secret_key() -> str:
@@ -53,9 +103,13 @@ def get_auth_secret_key() -> str:
     
     Security Validation:
       1. Must be defined in environment (AUTH_SECRET_KEY).
-      2. Must contain at least 32 characters (256 bits of entropy).
-      3. Fails server startup immediately if missing or weak in production.
-      4. Secrets are NEVER logged.
+      2. Must contain at least 32 characters (256 bits of raw material).
+      3. Must NOT be a known example or placeholder string.
+      4. Must exhibit sufficient cryptographic entropy:
+         - Unique characters: at least 10 unique symbols (rejects trivial repeats like 'x' * 32).
+         - Shannon entropy: at least 3.0 bits per symbol.
+      5. Fails server startup immediately if missing or weak in production.
+      6. Secrets are NEVER logged.
     """
     key = os.getenv("AUTH_SECRET_KEY", "").strip()
 
@@ -67,7 +121,16 @@ def get_auth_secret_key() -> str:
             return _EPHEMERAL_DEV_KEY
         raise RuntimeError(
             "CRITICAL SECURITY CONFIGURATION ERROR: AUTH_SECRET_KEY environment variable is not configured. "
-            "A cryptographically strong secret key (at least 32 characters / 256 bits) is mandatory in production."
+            "A cryptographically strong secret key (at least 32 bytes / 256 bits of securely generated random material) is mandatory in production. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
+    if key in KNOWN_INSECURE_SECRETS:
+        if allow_dev:
+            return key
+        raise ValueError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: AUTH_SECRET_KEY is configured with a known insecure placeholder or example value. "
+            "Generate a unique secret with: python -c \"import secrets; print(secrets.token_hex(32))\""
         )
 
     if len(key) < 32:
@@ -78,7 +141,36 @@ def get_auth_secret_key() -> str:
             f"({len(key)} characters). Minimum required length is 32 characters (256 bits)."
         )
 
+    # Entropy and character diversity validation
+    unique_chars = len(set(key))
+    entropy = calculate_shannon_entropy(key)
+
+    if not allow_dev:
+        if unique_chars < 10 or entropy < 3.0:
+            raise ValueError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: AUTH_SECRET_KEY has insufficient cryptographic entropy "
+                f"(entropy: {entropy:.2f} bits/symbol, unique chars: {unique_chars}). "
+                "Length alone is not entropy. Secret must be securely generated random material (e.g. python -c \"import secrets; print(secrets.token_hex(32))\")."
+            )
+
     return key
+
+
+def validate_auth_configuration() -> None:
+    """
+    Validates all authentication security configurations at application startup.
+    Executed during FastAPI lifespan / startup initialization.
+    
+    Aborts startup immediately if:
+      - Boolean flags have invalid syntax (e.g., REQUIRE_AUTH=treu).
+      - In production, AUTH_SECRET_KEY is missing, weak, low-entropy, or a known placeholder.
+    """
+    # 1. Validate boolean configurations (throws ValueError on invalid formats like 'treu')
+    is_auth_required()
+    is_dev_headers_allowed()
+
+    # 2. Validate secret key (throws RuntimeError if missing, ValueError if weak/low-entropy)
+    get_auth_secret_key()
 
 
 @dataclass

@@ -46,7 +46,7 @@ flowchart TD
 
 | Defense Layer | Mechanism | Protection Provided | Limitations & Threat Boundaries |
 | :--- | :--- | :--- | :--- |
-| **Authentication & Principal Resolution** | HMAC-SHA256 token verification with constant-time comparison, expiry (3600s), and clock skew limits | Binds user quotas to verified cryptographic identities. Rejects forged, unsigned (`usr_*`, `token_*`), or expired credentials. | Requires secure distribution of `AUTH_SECRET_KEY` (minimum 32 characters / 256 bits). |
+| **Authentication & Principal Resolution** | HMAC-SHA256 token verification with constant-time comparison, expiry (3600s), and clock skew limits | Binds user quotas to verified cryptographic identities. Rejects forged, unsigned (`usr_*`, `token_*`), expired, or low-entropy credentials. | Requires secure distribution of `AUTH_SECRET_KEY` (minimum 32 bytes / 256 bits of random material). |
 | **Token Bucket Quota** | Atomic Redis Lua script using Redis server clock (`TIME`) | Strict ceiling on request throughput per authenticated `user_id` (10 req/min). | Application-layer only. Large-scale volumetric L3/L4 DDoS attacks require upstream scrubbing (Cloudflare, AWS Shield). |
 | **Physical IP Guardrail** | Outer Token Bucket tracking IP addresses (30 req/min) | Prevents runaway consumption from a single physical connection or network. | Shared public NATs (universities, corporate offices) share quota. Configurable via subnets. |
 | **Trusted Proxy Resolution** | Reverse proxy chain traversal (RFC 7239 compliant) | Rejects spoofed `X-Forwarded-For` headers from untrusted direct peers. | Requires operator to correctly configure `TRUSTED_PROXIES` CIDRs in production. |
@@ -74,9 +74,17 @@ Production deployments strictly require cryptographic authentication (`REQUIRE_A
 4. **Anti-Spoofing & Unified Endpoints**:
    - Both `/limited-resource` and `/verify-challenge` share the exact same `get_authenticated_principal` dependency.
    - When an authenticated token is present, any client-supplied `user-id` header or body payload is ignored. The rate-limiting and challenge-verification identity is derived exclusively from the verified principal.
-5. **Secret Key Entropy Validation**:
+5. **Entropy Validation (Length is Not Entropy)**:
    - `AUTH_SECRET_KEY` must have a minimum length of 32 characters (256 bits).
-   - In production, missing or weak keys abort startup with an explicit configuration error. Secrets are never logged.
+   - In production, keys must contain securely generated random material: minimum 10 unique symbols and Shannon entropy $\ge 3.0$ bits/symbol. Trivial keys (such as `"x" * 32` or `"01" * 16`) and known documentation placeholders are rejected.
+   - Generate a secure key with:
+     ```bash
+     python -c "import secrets; print(secrets.token_hex(32))"
+     ```
+6. **Strict Boolean Configuration Parsing**:
+   - Configuration options like `REQUIRE_AUTH` and `ALLOW_UNAUTHENTICATED_DEV_HEADERS` strictly accept recognized boolean tokens (`true`, `false`, `1`, `0`, `yes`, `no`). Typos (e.g. `REQUIRE_AUTH=treu`) immediately fail startup rather than silently defaulting to insecure states.
+7. **Startup-Time Lifespan Validation**:
+   - Validation occurs eagerly during FastAPI application initialization (`lifespan`), halting process launch immediately on configuration errors before traffic can be received. Secrets are never logged.
 
 ---
 
@@ -151,6 +159,8 @@ The diagnostic endpoint `GET /model-stats` exposes active model centroids, evalu
 2. **Configure environment**:
    ```bash
    cp .env.example .env
+   # Generate your secret key:
+   python -c "import secrets; print(secrets.token_hex(32))"
    ```
 
 3. **Start local Redis**:
@@ -181,14 +191,14 @@ The stack launches:
 
 ## 🧪 Comprehensive Automated Test Suite
 
-The test suite contains **77 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
+The test suite contains **87 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
 
 ```bash
 pytest tests/ -v
 ```
 
 ### Test Categories:
-- **`tests/security/test_priority1_audit.py`** (26 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy, production authentication defaults, and identity anti-spoofing.
+- **`tests/security/test_priority1_audit.py`** (36 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy (Shannon entropy & diversity vs length), known placeholder blocklist, strict boolean configuration parsing, startup configuration validation through FastAPI lifespan, production authentication defaults, and identity anti-spoofing.
 - **`tests/unit/test_token_bucket.py`** (11 tests): Capacity, refill math, oversized requests, atomic concurrency, failure modes (`fail_closed`, `fail_open`, `local_fallback`), and RFC headers.
 - **`tests/unit/test_challenge.py`** (8 tests): Cryptographic ID generation, single-use enforcement, attempt exhaustion, user-session binding, and answer leak prevention.
 - **`tests/integration/test_model_sync.py`** (4 tests): Gaussian centroid persistence across restarts, cross-instance synchronization, and atomic EMA Lua updates.
