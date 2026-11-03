@@ -282,7 +282,9 @@ class RateLimiter:
         :param refill_rate: Tokens added per second (must be > 0).
         :param failure_mode: FailureMode strategy when Redis drops.
         :param enable_fallback: Deprecated legacy argument. If True, maps to LOCAL_FALLBACK.
-        :param max_local_keys: Maximum entries in local memory fallback to avoid memory leaks.
+        :param max_local_keys: Memory bound cleanup threshold for local fallback cache.
+            When cache entries exceed max_local_keys, stale entries (>1h) are purged, followed by
+            LRU batch eviction of the oldest 20% entries (at least 1 entry) to amortize sorting overhead.
         :param redis_client: Optional pre-configured Redis client instance (e.g. for testing).
         """
         # Validate initialization invariants (reject booleans, None, strings, NaN, infinity, <= 0)
@@ -479,7 +481,8 @@ class RateLimiter:
                     del self._local_buckets[k]
                 if len(self._local_buckets) > effective_max_keys:
                     sorted_items = sorted(self._local_buckets.items(), key=lambda item: item[1][1])
-                    for k, _ in sorted_items[: int(effective_max_keys * 0.2)]:
+                    evict_count = max(1, int(effective_max_keys * 0.2))
+                    for k, _ in sorted_items[:evict_count]:
                         del self._local_buckets[k]
 
             current_tokens, last_updated = self._local_buckets.get(user_id, (snapshot.capacity, now))

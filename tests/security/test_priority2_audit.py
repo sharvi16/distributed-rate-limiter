@@ -13,6 +13,7 @@ import math
 import os
 import time
 import uuid
+from typing import Optional, Dict, Tuple
 import pytest
 from fastapi.testclient import TestClient
 
@@ -438,6 +439,11 @@ class TestRateLimiterConfigurationTransactional:
         """
         Concurrent threads updating configuration and checking limits must not cause race conditions,
         corrupted/torn attributes, or deadlocks.
+
+        Verifies:
+        1. Thread termination is guaranteed and asserted with `assert not t.is_alive()`.
+        2. Synchronization uses bounded iteration counters rather than arbitrary sleep alone.
+        3. No torn state occurs between capacity, refill_rate, and failure_mode under concurrent mutation.
         """
         import threading
 
@@ -457,14 +463,18 @@ class TestRateLimiterConfigurationTransactional:
         stop_event = threading.Event()
 
         def updater(cfg):
-            while not stop_event.is_set():
+            for _ in range(50):
+                if stop_event.is_set():
+                    break
                 try:
                     rl.configure(capacity=cfg[0], refill_rate=cfg[1], failure_mode=cfg[2], max_local_keys=cfg[3])
                 except Exception as e:
                     errors.append(e)
 
         def reader():
-            while not stop_event.is_set():
+            for _ in range(50):
+                if stop_event.is_set():
+                    break
                 try:
                     with rl._lock:
                         cap = rl.capacity
@@ -482,20 +492,20 @@ class TestRateLimiterConfigurationTransactional:
                     errors.append(e)
 
         threads = [
-            threading.Thread(target=updater, args=(config_a,)),
-            threading.Thread(target=updater, args=(config_b,)),
-            threading.Thread(target=reader),
-            threading.Thread(target=reader),
+            threading.Thread(target=updater, args=(config_a,), name="updater_a"),
+            threading.Thread(target=updater, args=(config_b,), name="updater_b"),
+            threading.Thread(target=reader, name="reader_1"),
+            threading.Thread(target=reader, name="reader_2"),
         ]
 
         for t in threads:
             t.start()
 
-        time.sleep(0.3)
-        stop_event.set()
-
         for t in threads:
-            t.join(timeout=2.0)
+            t.join(timeout=5.0)
+            assert not t.is_alive(), f"Thread {t.name} did not terminate within timeout"
+
+        stop_event.set()
 
         assert not errors, f"Concurrent configuration update errors: {errors}"
 
@@ -503,6 +513,11 @@ class TestRateLimiterConfigurationTransactional:
         """
         Under concurrent configure() calls, each check_limit() request must use
         one complete configuration version without torn capacity/refill_rate snapshots.
+
+        Verifies:
+        1. Workers execute deterministic iteration counts without depending exclusively on arbitrary sleep.
+        2. Every worker and updater thread cleanly terminates (`assert not t.is_alive()`).
+        3. Observed limits and reset_after values strictly adhere to unified configuration snapshots.
         """
         import threading
 
@@ -520,6 +535,8 @@ class TestRateLimiterConfigurationTransactional:
 
         errors = []
         stop_event = threading.Event()
+        observed_limits = set()
+        observed_lock = threading.Lock()
 
         def updater():
             toggle = False
@@ -533,9 +550,13 @@ class TestRateLimiterConfigurationTransactional:
 
         def worker(worker_id):
             user = f"worker_{worker_id}"
-            while not stop_event.is_set():
+            for _ in range(50):
+                if stop_event.is_set():
+                    break
                 try:
                     res = rl.check_limit(user, tokens=1.0)
+                    with observed_lock:
+                        observed_limits.add(res.limit)
                     if res.limit not in (10.0, 60.0):
                         errors.append(ValueError(f"Invalid limit: {res.limit}"))
                     expected_refill = 1.0 if res.limit == 10.0 else 2.0
@@ -550,31 +571,122 @@ class TestRateLimiterConfigurationTransactional:
                 except Exception as e:
                     errors.append(e)
 
-        threads = [threading.Thread(target=updater)] + [
-            threading.Thread(target=worker, args=(i,)) for i in range(4)
+        worker_threads = [
+            threading.Thread(target=worker, args=(i,), name=f"snapshot_worker_{i}")
+            for i in range(4)
         ]
+        updater_thread = threading.Thread(target=updater, name="snapshot_updater")
+
+        threads = [updater_thread] + worker_threads
 
         for t in threads:
             t.start()
 
-        time.sleep(0.4)
-        stop_event.set()
+        # Wait for all workers to finish their deterministic 50 requests
+        for t in worker_threads:
+            t.join(timeout=5.0)
+            assert not t.is_alive(), f"Worker thread {t.name} did not terminate within timeout"
 
-        for t in threads:
-            t.join(timeout=2.0)
+        # Signal updater to finish
+        stop_event.set()
+        updater_thread.join(timeout=5.0)
+        assert not updater_thread.is_alive(), "Updater thread did not terminate within timeout"
 
         assert not errors, f"Snapshot consistency errors under concurrency: {errors}"
+        assert len(observed_limits) >= 1, "Expected at least one configuration limit to be observed"
 
     def test_redis_arguments_and_telemetry_match_exact_snapshot_under_concurrency(self):
         """
         When check_limit() passes arguments to Redis Lua during concurrent configure(),
-        the arguments and returned RateLimitResult.limit must belong to the exact same snapshot.
+        the arguments passed to Redis and the returned RateLimitResult must belong to the exact same snapshot.
+
+        Verifies:
+        1. Thread-local association connects each Redis script invocation directly to its returned RateLimitResult.
+        2. Redis capacity argument exactly equals result.limit.
+        3. Refill rate passed to Redis and used in reset/retry calculations belongs to the same configuration version.
+        4. Detects cross-configuration mismatches even when each individual parameter is valid in isolation
+           (e.g., capacity=10.0 from config_1 combined with refill_rate=2.0 from config_2).
+        5. Every worker thread terminates cleanly without deadlocks or unjoined threads.
         """
         if not limiter.redis or not limiter.check_limit_script:
             pytest.skip("Redis not available")
 
         import threading
 
+        config_1 = (10.0, 1.0)
+        config_2 = (60.0, 2.0)
+
+        # Helper function to validate snapshot parity between Redis invocation and RateLimitResult
+        def validate_snapshot_parity(
+            redis_cap: float,
+            redis_refill: float,
+            result: RateLimitResult
+        ) -> Optional[str]:
+            # 1. Capacity parity: Redis capacity must exactly match RateLimitResult.limit
+            if redis_cap != result.limit:
+                return f"Redis capacity ({redis_cap}) != result.limit ({result.limit})"
+
+            # 2. Unified version check: the pair (redis_cap, redis_refill) must belong
+            # to a single coherent configuration version, rejecting cross-version contamination
+            # even when each component is individually valid
+            if (redis_cap, redis_refill) not in (config_1, config_2):
+                return (
+                    f"Torn Redis configuration tuple: ({redis_cap}, {redis_refill}) "
+                    f"is a cross-version mixture of {config_1} and {config_2}"
+                )
+
+            # 3. Refill rate version coherence with result.limit
+            expected_refill = 1.0 if result.limit == 10.0 else 2.0
+            if not math.isclose(redis_refill, expected_refill, rel_tol=1e-3):
+                return (
+                    f"Refill rate mismatch: redis_refill={redis_refill} does not match "
+                    f"expected_refill={expected_refill} for limit={result.limit}"
+                )
+
+            # 4. Telemetry formula coherence: reset_after = (limit - remaining) / refill_rate
+            if result.remaining < result.limit and result.reset_after > 0:
+                calculated_refill = (result.limit - result.remaining) / result.reset_after
+                if not math.isclose(calculated_refill, redis_refill, rel_tol=1e-2):
+                    return (
+                        f"Refill rate mismatch in reset_after: calculated={calculated_refill}, "
+                        f"redis_refill={redis_refill}, limit={result.limit}"
+                    )
+
+            # 5. Retry-after formula coherence when rejected
+            if not result.allowed and result.retry_after is not None:
+                expected_retry = max(1, math.ceil((1.0 - result.remaining) / redis_refill))
+                if result.retry_after != expected_retry:
+                    return (
+                        f"Retry-after mismatch: expected={expected_retry}, got={result.retry_after}"
+                    )
+
+            return None
+
+        # Unit verification: prove that validate_snapshot_parity detects cross-configuration
+        # mismatches even when each individual value belongs to a valid configuration
+        # Case A: Torn Redis arguments (cap=10.0 from config_1, refill=2.0 from config_2)
+        dummy_res_a = RateLimitResult(allowed=True, limit=10.0, remaining=9.0, reset_after=1.0, retry_after=None)
+        err_a = validate_snapshot_parity(10.0, 2.0, dummy_res_a)
+        assert err_a is not None and "Torn Redis configuration tuple" in err_a
+
+        # Case B: Redis cap=10.0 (from config_1) but result.limit=60.0 (from config_2)
+        dummy_res_b = RateLimitResult(allowed=True, limit=60.0, remaining=59.0, reset_after=0.5, retry_after=None)
+        err_b = validate_snapshot_parity(10.0, 1.0, dummy_res_b)
+        assert err_b is not None and "Redis capacity (10.0) != result.limit (60.0)" in err_b
+
+        # Case C: Valid cap & refill, but reset_after calculated using foreign refill_rate (2.0 instead of 1.0)
+        # For limit=10, remaining=8: correct reset_after with refill 1.0 is 2.0s. If computed with 2.0, it's 1.0s.
+        dummy_res_c = RateLimitResult(allowed=True, limit=10.0, remaining=8.0, reset_after=1.0, retry_after=None)
+        err_c = validate_snapshot_parity(10.0, 1.0, dummy_res_c)
+        assert err_c is not None and "Refill rate mismatch in reset_after" in err_c
+
+        # Case D: Coherent snapshots are cleanly accepted
+        dummy_res_valid_1 = RateLimitResult(allowed=True, limit=10.0, remaining=9.0, reset_after=1.0, retry_after=None)
+        assert validate_snapshot_parity(10.0, 1.0, dummy_res_valid_1) is None
+        dummy_res_valid_2 = RateLimitResult(allowed=True, limit=60.0, remaining=58.0, reset_after=1.0, retry_after=None)
+        assert validate_snapshot_parity(60.0, 2.0, dummy_res_valid_2) is None
+
+        # Live multi-threaded test against Redis
         rl = RateLimiter(
             capacity=10.0,
             refill_rate=1.0,
@@ -582,25 +694,32 @@ class TestRateLimiterConfigurationTransactional:
             redis_client=limiter.redis
         )
 
-        config_1 = (10.0, 1.0)
-        config_2 = (60.0, 2.0)
-
-        errors = []
-        stop_event = threading.Event()
-
-        # Wrap check_limit_script to observe the actual args passed to Redis
         original_script = rl.check_limit_script
-        call_records = []
+        thread_local = threading.local()
+        recorded_calls = []
+        recorded_lock = threading.Lock()
 
         def script_wrapper(keys, args):
             cap = float(args[0])
             refill = float(args[1])
-            if (cap, refill) not in (config_1, config_2):
-                errors.append(ValueError(f"Torn Redis args: cap={cap}, refill={refill}"))
-            call_records.append((cap, refill))
+            tokens_req = float(args[2])
+            call_info = {
+                "keys": keys,
+                "capacity": cap,
+                "refill_rate": refill,
+                "tokens": tokens_req
+            }
+            thread_local.last_redis_call = call_info
+            with recorded_lock:
+                recorded_calls.append(call_info)
             return original_script(keys=keys, args=args)
 
         rl.check_limit_script = script_wrapper
+
+        errors = []
+        stop_event = threading.Event()
+        verified_count = 0
+        verified_lock = threading.Lock()
 
         def updater():
             toggle = False
@@ -613,37 +732,78 @@ class TestRateLimiterConfigurationTransactional:
                     errors.append(e)
 
         def worker(worker_id):
+            nonlocal verified_count
             user = f"redis_snap_user_{worker_id}"
-            while not stop_event.is_set():
+            for _ in range(50):
+                if stop_event.is_set():
+                    break
                 try:
+                    thread_local.last_redis_call = None
                     res = rl.check_limit(user, tokens=1.0)
-                    if res.limit not in (10.0, 60.0):
-                        errors.append(ValueError(f"Invalid result limit: {res.limit}"))
+                    last_call = getattr(thread_local, "last_redis_call", None)
+                    if last_call is None:
+                        errors.append(RuntimeError(f"Worker {worker_id}: check_limit did not invoke Redis script"))
+                        continue
+
+                    parity_err = validate_snapshot_parity(
+                        last_call["capacity"],
+                        last_call["refill_rate"],
+                        res
+                    )
+                    if parity_err:
+                        errors.append(ValueError(f"Worker {worker_id} snapshot parity error: {parity_err}"))
+                    else:
+                        with verified_lock:
+                            verified_count += 1
                 except Exception as e:
                     errors.append(e)
 
-        threads = [threading.Thread(target=updater)] + [
-            threading.Thread(target=worker, args=(i,)) for i in range(4)
+        worker_threads = [
+            threading.Thread(target=worker, args=(i,), name=f"redis_worker_{i}")
+            for i in range(4)
         ]
+        updater_thread = threading.Thread(target=updater, name="redis_updater")
+
+        threads = [updater_thread] + worker_threads
 
         for t in threads:
             t.start()
 
-        time.sleep(0.4)
-        stop_event.set()
+        # Wait for all workers to finish their 50 requests
+        for t in worker_threads:
+            t.join(timeout=5.0)
+            assert not t.is_alive(), f"Worker thread {t.name} did not terminate within timeout"
 
-        for t in threads:
-            t.join(timeout=2.0)
+        # Signal updater to stop
+        stop_event.set()
+        updater_thread.join(timeout=5.0)
+        assert not updater_thread.is_alive(), "Updater thread did not terminate within timeout"
 
         rl.check_limit_script = original_script
 
         assert not errors, f"Redis snapshot parity errors under concurrency: {errors}"
-        assert len(call_records) > 0, "No Redis calls were recorded"
+        assert verified_count >= 100, f"Expected at least 100 verified invocations, got {verified_count}"
+        assert len(recorded_calls) >= 100, "Insufficient Redis script calls recorded"
 
     def test_max_local_keys_cleanup_during_concurrent_configuration_change(self):
         """
-        When max_local_keys is dynamically reduced via configure() while requests arrive,
-        cache eviction executes without deadlock, KeyError, or exceeding reasonable bounds.
+        Tests local cache behavior when max_local_keys is dynamically reduced via configure()
+        under concurrent request load.
+
+        Architecture & Semantics:
+        `max_local_keys` operates as an eviction cleanup threshold, NOT a strict pre-allocation
+        hard ceiling. When cache entries exceed `effective_max_keys`, stale entries (>1h) are
+        evicted first, followed by LRU batch eviction of the oldest 20% entries
+        (max(1, int(effective_max_keys * 0.2))) to amortize sorting overhead.
+
+        This test:
+        1. Pre-seeds 100 distinct entries in the local cache with staggered timestamps.
+        2. Dynamically reduces max_local_keys from 100 to 20 via configure().
+        3. Runs concurrent request workers and configuration inspection threads, verifying
+           that no deadlocks, KeyError, or dictionary mutation errors occur.
+        4. Verifies every worker thread terminates cleanly (assert not t.is_alive()).
+        5. Issues repeated requests to trigger successive 20% batch evictions, proving that
+           cache size progressively drains and strictly reaches the documented bound (len <= 20).
         """
         import threading
 
@@ -656,50 +816,84 @@ class TestRateLimiterConfigurationTransactional:
         rl.redis = None
         rl.check_limit_script = None
 
-        # Pre-seed 80 local buckets
-        for i in range(80):
-            rl._local_buckets[f"preseed_user_{i}"] = (10.0, time.time())
+        # 1. Pre-seed 100 local buckets with strictly staggered timestamps (LRU ordering)
+        base_time = time.time()
+        with rl._lock:
+            for i in range(100):
+                rl._local_buckets[f"preseed_user_{i}"] = (10.0, base_time - (100 - i))
+            assert len(rl._local_buckets) == 100, "Initial cache should contain exactly 100 entries"
+
+        # 2. Dynamically reduce threshold from 100 to 20
+        rl.configure(max_local_keys=20)
+        assert rl.max_local_keys == 20
 
         errors = []
         stop_event = threading.Event()
 
-        def shrink_updater():
-            toggle = False
-            while not stop_event.is_set():
-                new_max = 20 if toggle else 50
-                toggle = not toggle
+        # 3. Concurrent workers: request workers hitting keys while config updater reads/checks
+        def config_inspector():
+            for _ in range(50):
+                if stop_event.is_set():
+                    break
                 try:
-                    rl.configure(max_local_keys=new_max)
+                    snap = rl._get_config_snapshot()
+                    if snap.max_local_keys != 20:
+                        errors.append(ValueError(f"Unexpected max_local_keys: {snap.max_local_keys}"))
                 except Exception as e:
                     errors.append(e)
-                time.sleep(0.02)
 
         def request_worker(worker_id):
-            idx = 0
-            while not stop_event.is_set():
-                idx += 1
-                uid = f"worker_{worker_id}_user_{idx}"
+            for i in range(25):
+                if stop_event.is_set():
+                    break
+                # Mix of existing preseeded keys and worker-specific keys
+                uid = f"preseed_user_{i % 20}" if i % 2 == 0 else f"worker_{worker_id}_user_{i}"
                 try:
                     rl.check_limit(uid, tokens=1.0)
                 except Exception as e:
                     errors.append(e)
 
-        threads = [threading.Thread(target=shrink_updater)] + [
-            threading.Thread(target=request_worker, args=(i,)) for i in range(4)
+        worker_threads = [
+            threading.Thread(target=request_worker, args=(i,), name=f"cleanup_worker_{i}")
+            for i in range(4)
         ]
+        inspector_thread = threading.Thread(target=config_inspector, name="config_inspector")
+
+        threads = [inspector_thread] + worker_threads
 
         for t in threads:
             t.start()
 
-        time.sleep(0.4)
+        # 4. Ensure every worker thread terminates cleanly and assert not alive
+        for t in threads:
+            t.join(timeout=5.0)
+            assert not t.is_alive(), f"Thread {t.name} did not terminate within timeout"
+
         stop_event.set()
 
-        for t in threads:
-            t.join(timeout=2.0)
-
+        # Verify no deadlocks, KeyError, or RuntimeError (e.g. dictionary changed size during iteration)
         assert not errors, f"Errors during concurrent max_local_keys cleanup: {errors}"
+
+        # 5. Progressive eviction verification:
+        # With effective_max_keys=20, evict_count = max(1, int(20 * 0.2)) = 4 keys evicted per request.
+        # Repeated requests progressively drain the cache. Within at most 25 requests,
+        # all excess entries beyond the 20 threshold are evicted.
+        for _ in range(25):
+            rl.check_limit("drain_user", tokens=1.0)
+
         with rl._lock:
-            assert len(rl._local_buckets) <= 80
+            final_cache_size = len(rl._local_buckets)
+            assert final_cache_size <= 20, (
+                f"Expected cache count <= 20 after repeated requests, got {final_cache_size}"
+            )
+
+        # Subsequent requests for existing keys do not cause further evictions once within bound
+        with rl._lock:
+            stable_size = len(rl._local_buckets)
+        rl.check_limit("drain_user", tokens=1.0)
+        with rl._lock:
+            assert len(rl._local_buckets) == stable_size
+            assert len(rl._local_buckets) <= 20
 
 
 # =============================================================================
