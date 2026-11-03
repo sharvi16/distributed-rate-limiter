@@ -98,26 +98,53 @@ jobs:
             sleep 2
           done
 
-          # Verify API container fails fast on incorrect password
+          # Launch API container with incorrect Redis credentials
           echo "Verifying API fails fast with bad Redis credentials..."
-          set +e
-          docker run --rm \
-            --network ratelimiter_rate_limiter_net \
+          CONTAINER_ID=$(docker run -d \
+            --network rate_limiter_net \
             -e ENVIRONMENT=production \
             -e AUTH_SECRET_KEY=c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e \
             -e ADMIN_API_KEY=test-admin-secret-at-least-32-chars-long-12345 \
             -e REDIS_URL=redis://rate_limiter_redis:6379 \
             -e REDIS_PASSWORD=wrong_password_attempt_32_chars_long \
             -e RATE_LIMITER_FAILURE_MODE=fail_closed \
-            ratelimiter-api:latest
-          EXIT_CODE=$?
-          set -e
+            rate-limiter-api:latest)
 
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "SECURITY ERROR: API started successfully despite invalid Redis password!"
+          if [ -z "$CONTAINER_ID" ]; then
+            echo "DOCKER RUN ERROR: Failed to launch API container!"
             exit 1
           fi
-          echo "VERIFIED: API container exited with code $EXIT_CODE under fail-closed mode."
+
+          echo "Launched API container: $CONTAINER_ID. Monitoring exit status..."
+
+          CONTAINER_EXITED=0
+          for i in $(seq 1 15); do
+            STATUS=$(docker inspect --format='{{.State.Status}}' "$CONTAINER_ID" 2>/dev/null || echo "unknown")
+            echo "Status check $i: $STATUS"
+            if [ "$STATUS" = "exited" ]; then
+              CONTAINER_EXITED=1
+              break
+            fi
+            sleep 2
+          done
+
+          LOGS=$(docker logs "$CONTAINER_ID" 2>&1)
+          docker rm -f "$CONTAINER_ID" 2>/dev/null || true
+
+          echo "Container Logs:"
+          echo "$LOGS"
+
+          if [ $CONTAINER_EXITED -ne 1 ]; then
+            echo "SECURITY ERROR: API container unexpectedly started and remained running despite invalid Redis password!"
+            exit 1
+          fi
+
+          if ! echo "$LOGS" | grep -qE "Rate limiter startup connectivity check failed|invalid username-password pair|AuthenticationError|authentication failed|NOAUTH Authentication required"; then
+            echo "SECURITY ERROR: API container exited for an unexpected reason (not Redis auth failure)!"
+            exit 1
+          fi
+
+          echo "VERIFIED: API container exited specifically due to Redis authentication failure."
 
           # Clean up badauth container state
           docker compose --env-file .env.badauth down -v
@@ -140,14 +167,23 @@ jobs:
           docker compose --env-file .env.deploy up -d
 
           # Wait for API to report healthy
+          API_HEALTHY=0
           for i in $(seq 1 20); do
             HEALTH=$(docker inspect --format='{{json .State.Health.Status}}' rate_limiter_api 2>/dev/null || echo '"starting"')
             if [ "$HEALTH" = '"healthy"' ]; then
               echo "API is healthy."
+              API_HEALTHY=1
               break
             fi
             sleep 2
           done
+
+          if [ $API_HEALTHY -ne 1 ]; then
+            echo "DEPLOYMENT ERROR: API container failed to report healthy within timeout."
+            docker inspect rate_limiter_api
+            docker logs rate_limiter_api
+            exit 1
+          fi
 
       - name: Verify Redis Port Isolation and API Health Endpoint
         run: |
@@ -161,7 +197,7 @@ jobs:
           # 2. Verify API health endpoint
           RESPONSE=$(curl -fsS http://127.0.0.1:8000/)
           echo "API Response: $RESPONSE"
-          echo "$RESPONSE" | grep -q '"redis_connected":true' || echo "$RESPONSE" | grep -q '"redis_connected": true'
+          python3 -c "import sys, json; data = json.load(sys.stdin); assert data.get('redis_connected') is True, f'Unexpected health response: {data}'" <<< "$RESPONSE"
           echo "VERIFIED: API is healthy and connected to authenticated Redis."
 
       - name: Clean Up Docker Compose Resources

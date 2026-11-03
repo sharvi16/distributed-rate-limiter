@@ -25,14 +25,18 @@ def reset_global_rate_limiters():
             redis_password=None,
             ssl_certfile=None,
             ssl_keyfile=None,
-            ssl_ca_certs=None
+            ssl_ca_certs=None,
+            ssl_cert_reqs=None,
+            ssl_check_hostname=None
         )
         main.ip_limiter.configure(
             redis_url="redis://localhost:6379",
             redis_password=None,
             ssl_certfile=None,
             ssl_keyfile=None,
-            ssl_ca_certs=None
+            ssl_ca_certs=None,
+            ssl_cert_reqs=None,
+            ssl_check_hostname=None
         )
     except Exception:
         pass

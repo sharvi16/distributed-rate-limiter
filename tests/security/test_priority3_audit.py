@@ -931,6 +931,95 @@ class TestRedisClientMTLSConfiguration:
             assert conn_kwargs["ssl_ca_certs"] == ca.name
             assert main.ip_limiter.redis.connection_pool.connection_kwargs["ssl_certfile"] == cert.name
 
+    def test_configure_explicitly_clears_ssl_parameters_transactionally(self):
+        """RateLimiter.configure() explicitly clears SSL settings when caller supplies None."""
+        with tempfile.NamedTemporaryFile() as cert, tempfile.NamedTemporaryFile() as key, tempfile.NamedTemporaryFile() as ca:
+            limiter = RateLimiter(
+                redis_url="rediss://localhost:6379/0",
+                ssl_certfile=cert.name,
+                ssl_keyfile=key.name,
+                ssl_ca_certs=ca.name,
+                ssl_cert_reqs="required",
+                ssl_check_hostname=True,
+                failure_mode=FailureMode.LOCAL_FALLBACK
+            )
+            assert limiter.ssl_certfile == cert.name
+            assert limiter.redis.connection_pool.connection_class is redis.connection.SSLConnection
+
+            # Explicitly clear SSL settings and switch to plain redis://
+            limiter.configure(
+                redis_url="redis://localhost:6379/0",
+                ssl_certfile=None,
+                ssl_keyfile=None,
+                ssl_ca_certs=None,
+                ssl_cert_reqs=None,
+                ssl_check_hostname=None
+            )
+
+            assert limiter.redis_url == "redis://localhost:6379/0"
+            assert limiter.ssl_certfile is None
+            assert limiter.ssl_keyfile is None
+            assert limiter.ssl_ca_certs is None
+            assert limiter.ssl_cert_reqs is None
+            assert limiter.ssl_check_hostname is None
+            assert limiter.redis.connection_pool.connection_class is redis.connection.Connection
+            assert "ssl_certfile" not in limiter.redis.connection_pool.connection_kwargs
+
+    def test_configure_omitted_ssl_parameters_retain_existing_values(self):
+        """RateLimiter.configure() does not mutate or clear omitted SSL settings."""
+        with tempfile.NamedTemporaryFile() as cert, tempfile.NamedTemporaryFile() as key:
+            limiter = RateLimiter(
+                redis_url="rediss://localhost:6379/0",
+                ssl_certfile=cert.name,
+                ssl_keyfile=key.name,
+                failure_mode=FailureMode.LOCAL_FALLBACK
+            )
+            # Update only capacity and refill rate
+            limiter.configure(capacity=50.0, refill_rate=2.0)
+
+            assert limiter.capacity == 50.0
+            assert limiter.refill_rate == 2.0
+            assert limiter.ssl_certfile == cert.name
+            assert limiter.ssl_keyfile == key.name
+            assert limiter.redis.connection_pool.connection_class is redis.connection.SSLConnection
+            assert limiter.redis.connection_pool.connection_kwargs["ssl_certfile"] == cert.name
+
+    def test_configure_switching_to_plain_redis_without_clearing_ssl_fails_transactionally(self):
+        """Switching to plain redis:// without clearing active SSL settings fails with state unchanged."""
+        with tempfile.NamedTemporaryFile() as cert, tempfile.NamedTemporaryFile() as key:
+            limiter = RateLimiter(
+                redis_url="rediss://localhost:6379/0",
+                ssl_certfile=cert.name,
+                ssl_keyfile=key.name,
+                failure_mode=FailureMode.LOCAL_FALLBACK
+            )
+            # Attempt to switch to plain redis:// without clearing ssl_certfile/keyfile
+            with pytest.raises(ValueError, match="plain 'redis://' connection scheme cannot claim TLS"):
+                limiter.configure(redis_url="redis://localhost:6379/0")
+
+            # State must remain unmutated
+            assert limiter.redis_url == "rediss://localhost:6379/0"
+            assert limiter.ssl_certfile == cert.name
+            assert limiter.ssl_keyfile == key.name
+            assert limiter.redis.connection_pool.connection_class is redis.connection.SSLConnection
+
+    def test_configure_invalid_ssl_file_fails_transactionally(self):
+        """Passing nonexistent SSL certificate paths fails fast before mutating state."""
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379/0",
+            failure_mode=FailureMode.LOCAL_FALLBACK
+        )
+        with pytest.raises(ValueError, match="client certificate file does not exist"):
+            limiter.configure(
+                redis_url="rediss://localhost:6379/0",
+                ssl_certfile="/nonexistent/cert.pem",
+                ssl_keyfile="/nonexistent/key.pem"
+            )
+
+        assert limiter.redis_url == "redis://localhost:6379/0"
+        assert limiter.ssl_certfile is None
+        assert limiter.redis.connection_pool.connection_class is redis.connection.Connection
+
 
 # =============================================================================
 # 7. Redis Startup Connectivity & PING Verification
@@ -1006,6 +1095,63 @@ class TestRedisStartupConnectivityCheck:
             failure_mode=FailureMode.LOCAL_FALLBACK
         )
         assert limiter_fallback.verify_connection(timeout=0.5) is False
+
+    def test_verify_connection_respects_custom_timeout_and_fails_closed(self, monkeypatch):
+        """verify_connection(timeout) times out and raises RedisUnavailableError when ping exceeds timeout."""
+        import time
+
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+
+        def slow_ping():
+            time.sleep(0.3)
+            return True
+
+        monkeypatch.setattr(limiter.redis, "ping", slow_ping)
+
+        with pytest.raises(RedisUnavailableError) as exc_info:
+            limiter.verify_connection(timeout=0.05)
+
+        err = str(exc_info.value)
+        assert "timed out after 0.05s" in err
+
+    def test_verify_connection_timeout_returns_false_under_fail_open_and_fallback(self, monkeypatch):
+        """verify_connection(timeout) returns False without raising when slow ping occurs in fail_open/fallback."""
+        import time
+
+        def slow_ping():
+            time.sleep(0.3)
+            return True
+
+        limiter_open = RateLimiter(
+            redis_url="redis://localhost:6379",
+            failure_mode=FailureMode.FAIL_OPEN
+        )
+        monkeypatch.setattr(limiter_open.redis, "ping", slow_ping)
+        assert limiter_open.verify_connection(timeout=0.05) is False
+
+        limiter_fallback = RateLimiter(
+            redis_url="redis://localhost:6379",
+            failure_mode=FailureMode.LOCAL_FALLBACK
+        )
+        monkeypatch.setattr(limiter_fallback.redis, "ping", slow_ping)
+        assert limiter_fallback.verify_connection(timeout=0.05) is False
+
+    def test_verify_connection_rejects_invalid_timeout(self):
+        """verify_connection() strictly validates timeout argument."""
+        limiter = RateLimiter(redis_url="redis://localhost:6379", failure_mode=FailureMode.LOCAL_FALLBACK)
+        with pytest.raises(ValueError, match="timeout must be a positive number"):
+            limiter.verify_connection(timeout=-1.0)
+        with pytest.raises(ValueError, match="timeout must be a positive number"):
+            limiter.verify_connection(timeout=0)
+        with pytest.raises(ValueError, match="timeout cannot be a boolean"):
+            limiter.verify_connection(timeout=True)
+        with pytest.raises(ValueError, match="timeout cannot be NaN"):
+            limiter.verify_connection(timeout=float("nan"))
+        with pytest.raises(ValueError, match="timeout must be a number"):
+            limiter.verify_connection(timeout="0.5")
 
 
 # =============================================================================

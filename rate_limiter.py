@@ -33,6 +33,7 @@ Architectural Guarantees & Redis Time Semantics:
      and refresh key TTL without deducting, preserving correct accrued token state.
 """
 
+import concurrent.futures
 from enum import Enum
 import math
 import os
@@ -42,6 +43,9 @@ import time
 import urllib.parse
 from typing import Any, Dict, Optional, Tuple, Union
 import redis
+
+# Sentinel value to distinguish omitted arguments from explicitly supplied None in configure()
+_UNSET = object()
 
 
 class FailureMode(str, Enum):
@@ -448,37 +452,40 @@ class RateLimiter:
 
     def configure(
         self,
-        capacity: Optional[float] = None,
-        refill_rate: Optional[float] = None,
-        failure_mode: Optional[Union[FailureMode, str]] = None,
-        max_local_keys: Optional[int] = None,
-        redis_url: Optional[str] = None,
-        redis_password: Optional[str] = None,
-        ssl_certfile: Optional[str] = None,
-        ssl_keyfile: Optional[str] = None,
-        ssl_ca_certs: Optional[str] = None,
-        ssl_cert_reqs: Optional[str] = None,
-        ssl_check_hostname: Optional[bool] = None
+        capacity: Union[float, object] = _UNSET,
+        refill_rate: Union[float, object] = _UNSET,
+        failure_mode: Union[FailureMode, str, object] = _UNSET,
+        max_local_keys: Union[int, object] = _UNSET,
+        redis_url: Union[str, object] = _UNSET,
+        redis_password: Union[Optional[str], object] = _UNSET,
+        ssl_certfile: Union[Optional[str], object] = _UNSET,
+        ssl_keyfile: Union[Optional[str], object] = _UNSET,
+        ssl_ca_certs: Union[Optional[str], object] = _UNSET,
+        ssl_cert_reqs: Union[Optional[str], object] = _UNSET,
+        ssl_check_hostname: Union[Optional[bool], object] = _UNSET
     ) -> None:
         """
         Dynamically updates rate limiter configuration in place.
         Validates all supplied arguments into temporary variables first.
         Applies changes under instance lock only if all validations succeed (all-or-nothing transactional update).
+
+        Callers can explicitly clear SSL certificate, key, CA, certificate requirement, and hostname-check
+        settings by passing None. Omitted parameters retain their current values.
         """
         new_capacity = None
-        if capacity is not None:
+        if capacity is not _UNSET:
             new_capacity = validate_positive_number("capacity", capacity)
 
         new_refill_rate = None
-        if refill_rate is not None:
+        if refill_rate is not _UNSET:
             new_refill_rate = validate_positive_number("refill_rate", refill_rate)
 
         new_max_local_keys = None
-        if max_local_keys is not None:
+        if max_local_keys is not _UNSET:
             new_max_local_keys = validate_positive_int("max_local_keys", max_local_keys)
 
         new_failure_mode = None
-        if failure_mode is not None:
+        if failure_mode is not _UNSET:
             if isinstance(failure_mode, str):
                 try:
                     new_failure_mode = FailureMode(failure_mode.lower())
@@ -490,19 +497,22 @@ class RateLimiter:
                 raise ValueError(f"failure_mode must be FailureMode or str, got {type(failure_mode).__name__}")
 
         new_redis_url = None
-        if redis_url is not None:
+        if redis_url is not _UNSET:
+            if redis_url is None:
+                raise ValueError("redis_url cannot be None")
             clean_url = redis_url.strip()
             if not clean_url:
                 raise ValueError("redis_url cannot be empty")
             new_redis_url = clean_url
 
+        changed_redis_password = (redis_password is not _UNSET)
         new_redis_password = None
-        if redis_password is not None:
-            new_redis_password = redis_password if redis_password != "" else None
+        if changed_redis_password:
+            new_redis_password = redis_password if (redis_password is not None and redis_password != "") else None
 
         # Verify credential consistency between URL and password parameter (with percent-encoding normalization)
         target_url = new_redis_url if new_redis_url is not None else self.redis_url
-        target_pwd = new_redis_password if redis_password is not None else self.redis_password
+        target_pwd = new_redis_password if changed_redis_password else self.redis_password
         parsed = urllib.parse.urlsplit(target_url)
         url_pwd = urllib.parse.unquote(parsed.password) if parsed.password is not None else None
         if url_pwd is not None and target_pwd is not None:
@@ -512,12 +522,26 @@ class RateLimiter:
                     "Contradictory Redis credentials: REDIS_PASSWORD does not match the password supplied in REDIS_URL."
                 )
 
-        # SSL / mTLS validation
-        new_ssl_certfile = ssl_certfile if ssl_certfile is not None else self.ssl_certfile
-        new_ssl_keyfile = ssl_keyfile if ssl_keyfile is not None else self.ssl_keyfile
-        new_ssl_ca_certs = ssl_ca_certs if ssl_ca_certs is not None else self.ssl_ca_certs
-        new_ssl_cert_reqs = ssl_cert_reqs if ssl_cert_reqs is not None else self.ssl_cert_reqs
-        new_ssl_check_hostname = ssl_check_hostname if ssl_check_hostname is not None else self.ssl_check_hostname
+        # SSL / mTLS parameter resolution: distinguish omitted (_UNSET) from explicitly passed (including None)
+        changed_ssl_certfile = (ssl_certfile is not _UNSET)
+        new_ssl_certfile = (ssl_certfile.strip() if (isinstance(ssl_certfile, str) and ssl_certfile.strip()) else None) if changed_ssl_certfile else self.ssl_certfile
+
+        changed_ssl_keyfile = (ssl_keyfile is not _UNSET)
+        new_ssl_keyfile = (ssl_keyfile.strip() if (isinstance(ssl_keyfile, str) and ssl_keyfile.strip()) else None) if changed_ssl_keyfile else self.ssl_keyfile
+
+        changed_ssl_ca_certs = (ssl_ca_certs is not _UNSET)
+        new_ssl_ca_certs = (ssl_ca_certs.strip() if (isinstance(ssl_ca_certs, str) and ssl_ca_certs.strip()) else None) if changed_ssl_ca_certs else self.ssl_ca_certs
+
+        changed_ssl_cert_reqs = (ssl_cert_reqs is not _UNSET)
+        new_ssl_cert_reqs = (ssl_cert_reqs.strip() if (isinstance(ssl_cert_reqs, str) and ssl_cert_reqs.strip()) else None) if changed_ssl_cert_reqs else self.ssl_cert_reqs
+
+        changed_ssl_check_hostname = (ssl_check_hostname is not _UNSET)
+        if changed_ssl_check_hostname:
+            if ssl_check_hostname is not None and not isinstance(ssl_check_hostname, bool):
+                raise ValueError(f"ssl_check_hostname must be a boolean or None, got {type(ssl_check_hostname).__name__}")
+            new_ssl_check_hostname = ssl_check_hostname
+        else:
+            new_ssl_check_hostname = self.ssl_check_hostname
 
         target_is_rediss = target_url.startswith("rediss://")
         target_is_plain = target_url.startswith("redis://")
@@ -535,17 +559,18 @@ class RateLimiter:
                 raise ValueError(f"mTLS client certificate file does not exist: {new_ssl_certfile!r}")
             if not os.path.isfile(new_ssl_keyfile):
                 raise ValueError(f"mTLS client private key file does not exist: {new_ssl_keyfile!r}")
-            if new_ssl_ca_certs and not os.path.isfile(new_ssl_ca_certs):
-                raise ValueError(f"mTLS CA certificate file does not exist: {new_ssl_ca_certs!r}")
+
+        if target_is_rediss and new_ssl_ca_certs and not os.path.isfile(new_ssl_ca_certs):
+            raise ValueError(f"mTLS CA certificate file does not exist: {new_ssl_ca_certs!r}")
 
         reconnect_redis = (
             (new_redis_url is not None and new_redis_url != self.redis_url) or
-            (redis_password is not None and new_redis_password != self.redis_password) or
-            (ssl_certfile is not None and ssl_certfile != self.ssl_certfile) or
-            (ssl_keyfile is not None and ssl_keyfile != self.ssl_keyfile) or
-            (ssl_ca_certs is not None and ssl_ca_certs != self.ssl_ca_certs) or
-            (ssl_cert_reqs is not None and ssl_cert_reqs != self.ssl_cert_reqs) or
-            (ssl_check_hostname is not None and ssl_check_hostname != self.ssl_check_hostname)
+            (changed_redis_password and new_redis_password != self.redis_password) or
+            (changed_ssl_certfile and new_ssl_certfile != self.ssl_certfile) or
+            (changed_ssl_keyfile and new_ssl_keyfile != self.ssl_keyfile) or
+            (changed_ssl_ca_certs and new_ssl_ca_certs != self.ssl_ca_certs) or
+            (changed_ssl_cert_reqs and new_ssl_cert_reqs != self.ssl_cert_reqs) or
+            (changed_ssl_check_hostname and new_ssl_check_hostname != self.ssl_check_hostname)
         )
 
         # All validations passed; atomically mutate instance state under lock
@@ -561,17 +586,17 @@ class RateLimiter:
             if reconnect_redis:
                 if new_redis_url is not None:
                     self.redis_url = new_redis_url
-                if redis_password is not None:
+                if changed_redis_password:
                     self.redis_password = new_redis_password
-                if ssl_certfile is not None:
+                if changed_ssl_certfile:
                     self.ssl_certfile = new_ssl_certfile
-                if ssl_keyfile is not None:
+                if changed_ssl_keyfile:
                     self.ssl_keyfile = new_ssl_keyfile
-                if ssl_ca_certs is not None:
+                if changed_ssl_ca_certs:
                     self.ssl_ca_certs = new_ssl_ca_certs
-                if ssl_cert_reqs is not None:
+                if changed_ssl_cert_reqs:
                     self.ssl_cert_reqs = new_ssl_cert_reqs
-                if ssl_check_hostname is not None:
+                if changed_ssl_check_hostname:
                     self.ssl_check_hostname = new_ssl_check_hostname
                 self._init_redis()
 
@@ -622,16 +647,26 @@ class RateLimiter:
 
         Under FAIL_CLOSED:
           - Raises RedisUnavailableError (with sanitized error messages) if Redis is
-            unreachable, down, or authentication fails.
+            unreachable, down, authentication fails, or execution exceeds timeout.
         Under FAIL_OPEN / LOCAL_FALLBACK:
-          - Returns False if unreachable or auth fails, permitting graceful degradation.
+          - Returns False if unreachable, auth fails, or times out, permitting graceful degradation.
         """
+        timeout_val = validate_positive_number("timeout", timeout)
         if not self.redis:
             if self.failure_mode == FailureMode.FAIL_CLOSED:
                 raise RedisUnavailableError("Rate limiter service unavailable (Redis client not configured)")
             return False
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            return bool(self.redis.ping())
+            future = executor.submit(self.redis.ping)
+            return bool(future.result(timeout=timeout_val))
+        except concurrent.futures.TimeoutError as e:
+            clean_err = f"Redis connectivity check timed out after {timeout_val}s"
+            if self.failure_mode == FailureMode.FAIL_CLOSED:
+                raise RedisUnavailableError(
+                    f"Rate limiter startup connectivity check failed: {clean_err}"
+                ) from e
+            return False
         except (redis.RedisError, TimeoutError, OSError) as e:
             clean_err = sanitize_redis_error_message(e)
             if self.failure_mode == FailureMode.FAIL_CLOSED:
@@ -639,9 +674,8 @@ class RateLimiter:
                     f"Rate limiter startup connectivity check failed (Redis unreachable or authentication failed: {clean_err})"
                 ) from e
             return False
-            if self.failure_mode == FailureMode.FAIL_CLOSED:
-                # Do not suppress if strictly failing closed on startup
-                pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _register_script(self):
         """Register the Lua script with Redis."""

@@ -32,6 +32,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: rate-limiter-api:latest
     container_name: rate_limiter_api
     ports:
       - "8000:8000"
@@ -61,4 +62,5 @@ volumes:
 
 networks:
   rate_limiter_net:
+    name: rate_limiter_net
     driver: bridge

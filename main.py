@@ -117,6 +117,9 @@ def sync_rate_limiter_configuration() -> None:
     cur_certfile = os.getenv("REDIS_SSL_CERTFILE", "").strip() or None
     cur_keyfile = os.getenv("REDIS_SSL_KEYFILE", "").strip() or None
     cur_ca_certs = os.getenv("REDIS_SSL_CA_CERTS", "").strip() or None
+    cur_cert_reqs = os.getenv("REDIS_SSL_CERT_REQS", "").strip() or None
+    cur_check_hostname_raw = os.getenv("REDIS_SSL_CHECK_HOSTNAME")
+    cur_check_hostname = parse_bool_env("REDIS_SSL_CHECK_HOSTNAME", True) if (cur_check_hostname_raw is not None and cur_check_hostname_raw.strip() != "") else None
 
     limiter.configure(
         capacity=user_cap,
@@ -126,7 +129,9 @@ def sync_rate_limiter_configuration() -> None:
         redis_password=cur_pwd,
         ssl_certfile=cur_certfile,
         ssl_keyfile=cur_keyfile,
-        ssl_ca_certs=cur_ca_certs
+        ssl_ca_certs=cur_ca_certs,
+        ssl_cert_reqs=cur_cert_reqs,
+        ssl_check_hostname=cur_check_hostname
     )
     ip_limiter.configure(
         capacity=ip_cap,
@@ -136,7 +141,9 @@ def sync_rate_limiter_configuration() -> None:
         redis_password=cur_pwd,
         ssl_certfile=cur_certfile,
         ssl_keyfile=cur_keyfile,
-        ssl_ca_certs=cur_ca_certs
+        ssl_ca_certs=cur_ca_certs,
+        ssl_cert_reqs=cur_cert_reqs,
+        ssl_check_hostname=cur_check_hostname
     )
     detector.redis = limiter.redis
     metrics_collector.set_redis(limiter.redis)
