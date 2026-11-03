@@ -286,6 +286,54 @@ def validate_auth_configuration() -> None:
     # 5. Validate admin diagnostic endpoint security configuration
     validate_admin_configuration()
 
+    # 6. Validate metrics endpoint security configuration
+    validate_metrics_configuration()
+
+
+def validate_metrics_configuration() -> None:
+    """
+    Validates metrics endpoint security configuration during application startup.
+
+    Security Rules:
+      - Validates PROTECT_METRICS boolean format if set (rejecting invalid strings like 'treu').
+      - In production (ENVIRONMENT=production or default):
+        * PROTECT_METRICS cannot be set to false (metrics contain internal telemetry and must be protected).
+      - If METRICS_API_KEY is configured:
+        * Must not be in KNOWN_INSECURE_SECRETS (ValueError).
+        * In production, must be at least 32 characters / 256 bits (ValueError).
+        * In production, must meet entropy requirements: Shannon entropy >= 3.0 bits/symbol
+          and at least 10 unique symbols (ValueError).
+    """
+    is_prod = is_production_env()
+    protect_metrics_str = os.getenv("PROTECT_METRICS")
+    if protect_metrics_str is not None and protect_metrics_str.strip() != "":
+        protect_metrics = parse_bool_env("PROTECT_METRICS", default=True if is_prod else False)
+        if is_prod and not protect_metrics:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: PROTECT_METRICS cannot be set to false in a production environment. "
+                "Metrics exposition contains sensitive operational, quota, and abuse telemetry and must be protected."
+            )
+
+    key = os.getenv("METRICS_API_KEY", "").strip()
+    if key:
+        if key in KNOWN_INSECURE_SECRETS:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: METRICS_API_KEY is configured with a known insecure placeholder."
+            )
+        if is_prod:
+            if len(key) < 32:
+                raise ValueError(
+                    f"CRITICAL SECURITY CONFIGURATION ERROR: METRICS_API_KEY has insufficient length "
+                    f"({len(key)} characters). Minimum required length is 32 characters (256 bits)."
+                )
+            unique_chars = len(set(key))
+            entropy = calculate_shannon_entropy(key)
+            if unique_chars < 10 or entropy < 3.0:
+                raise ValueError(
+                    f"CRITICAL SECURITY CONFIGURATION ERROR: METRICS_API_KEY has insufficient cryptographic entropy "
+                    f"(entropy: {entropy:.2f} bits/symbol, unique chars: {unique_chars})."
+                )
+
 
 @dataclass
 class AuthenticatedPrincipal:

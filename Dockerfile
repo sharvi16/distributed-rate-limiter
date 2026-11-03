@@ -1,33 +1,43 @@
-# Multi-stage / Production Dockerfile for Distributed Rate Limiter
-FROM python:3.12-slim as base
+# Multi-stage Production Dockerfile for Distributed Rate Limiter
+# Stage 1: Build dependencies in isolated builder container
+FROM python:3.12-slim AS builder
 
-# Prevent Python from writing .pyc files and enable unbuffered output
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-WORKDIR /app
+WORKDIR /build
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+    gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Install python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# Copy application source code
-COPY . .
+# Stage 2: Minimal runtime image running as non-privileged appuser
+FROM python:3.12-slim AS runtime
 
-# Create a non-privileged user for security compliance
-RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser \
-    && chown -R appuser:appgroup /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/install/bin:$PATH" \
+    PYTHONPATH="/install/lib/python3.12/site-packages:$PYTHONPATH"
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+
+COPY --from=builder /install /install
+COPY . /app
+
+RUN chown -R appuser:appgroup /app
 
 USER appuser
 
 EXPOSE 8000
 
-# Health check probing root endpoint
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/ || exit 1
 

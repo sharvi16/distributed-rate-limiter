@@ -135,16 +135,29 @@ The rate limiter evaluates continuous refills inside an atomic Lua script using 
 
 ## 📈 Prometheus Metrics & Observability
 
-The application exposes real-time telemetry at `GET /metrics` in Prometheus text format (version 0.0.4):
+The application exposes real-time telemetry at `GET /metrics` adhering to Prometheus text exposition format (version 0.0.4):
 
-- `ratelimit_requests_total{status="allowed|rate_limited|jailed|challenge_required"}`
+- **Cluster-Wide Multi-Worker Aggregation (Priority 3, Item 10)**:
+  - When Redis is connected, request and abuse counters are atomically updated and aggregated across all Uvicorn worker processes and application instances via Redis.
+  - Cluster-wide metrics are explicitly tagged with `scope="cluster"` (e.g. `ratelimit_requests_total{status="allowed",scope="cluster"}`).
+  - Each worker process also exposes process-local telemetry tagged with its worker PID (`ratelimit_process_requests_total{status="allowed",pid="<PID>"}`) to observe load distribution.
+  - When Redis is disconnected, metrics gracefully fall back to process-local counters labeled with `scope="process"` (`(process-local fallback: Redis unavailable)`), preventing misleading claims of cluster-wide figures when counters are worker-local.
+- **Metrics Access Protection (Priority 3, Item 9)**:
+  - In production (`ENVIRONMENT=production` or default), `/metrics` is strictly protected (fail-closed, HTTP 401 Unauthorized for unauthenticated requests).
+  - Can be authorized using `x-admin-key: <ADMIN_API_KEY>`, `x-metrics-key: <METRICS_API_KEY>`, or `Authorization: Bearer <METRICS_API_KEY>` via constant-time UTF-8 byte comparison.
+  - Alternatively, supports network-level scraper allowlisting via `METRICS_ALLOWED_CIDRS` (e.g., internal Prometheus pod subnet).
+  - In development/test, unauthenticated access can be permitted by setting `PROTECT_METRICS=false`.
+
+### Metrics Exposed:
+- `ratelimit_requests_total{status="allowed|rate_limited|jailed|challenge_required|error",scope="cluster|process"}`
+- `ratelimit_process_requests_total{status="...",pid="..."}`
 - `ratelimit_redis_connected` (gauge: 1 = healthy, 0 = disconnected)
-- `ratelimit_jailed_total` (counter of penalty box jailing events)
-- `ratelimit_challenges_issued_total`
-- `ratelimit_challenges_verified_total`
-- `ratelimit_challenges_exhausted_total`
-- `ratelimit_sybil_attacks_detected_total`
-- `ratelimit_vpn_hopping_detected_total`
+- `ratelimit_jailed_total{scope="cluster|process"}` (counter of penalty box jailing events)
+- `ratelimit_challenges_issued_total{scope="cluster|process"}`
+- `ratelimit_challenges_verified_total{scope="cluster|process"}`
+- `ratelimit_challenges_exhausted_total{scope="cluster|process"}`
+- `ratelimit_sybil_attacks_detected_total{scope="cluster|process"}`
+- `ratelimit_vpn_hopping_detected_total{scope="cluster|process"}`
 - `ratelimit_model_version` (gauge tracking online learning iterations)
 
 ---
@@ -195,29 +208,33 @@ The diagnostic endpoint `GET /model-stats` exposes active model centroids, evalu
 
 ---
 
-### Docker & Docker Compose Deployment
+### Docker & Docker Compose Deployment (Priority 3, Item 11)
 
-Run the complete multi-worker FastAPI application cluster and Redis service:
+Run the production multi-worker FastAPI application cluster and secured Redis service:
 
 ```bash
 docker compose up --build
 ```
 
-The stack launches:
-- **`redis`**: Redis 7 Alpine with Append-Only File (AOF) persistence and health checks.
-- **`api`**: Multi-worker FastAPI running as non-privileged `appuser` with automated health checks.
+#### Production Deployment Hardening:
+- **Genuine Multi-Stage Build**: `Dockerfile` separates the dependency compiler (`builder` stage) from the minimal runtime image (`runtime` stage), running under a non-root system user (`appuser:appgroup`).
+- **Internal Redis Network**: Redis port 6379 is NOT published publicly to `0.0.0.0` by default. It is accessible exclusively by the `api` container over the internal Docker bridge network (`rate_limiter_net`).
+- **Redis Authentication**: Supports password protection via `REDIS_PASSWORD` and `--requirepass` with authenticated healthchecks.
+- **Restricted Trusted Proxies**: Defaults to loopback (`127.0.0.1,::1`). Operators must only specify their actual ingress reverse proxies/load balancers; blanket-trusting RFC1918 private subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) is strictly avoided.
+- **Metrics Endpoint Security**: `PROTECT_METRICS=true` by default, protecting `/metrics` via `x-admin-key`, `x-metrics-key`, `Authorization: Bearer`, or `METRICS_ALLOWED_CIDRS`.
 
 ---
 
 ## 🧪 Comprehensive Automated Test Suite
 
-The test suite contains **144 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
+The test suite contains **162 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
 
 ```bash
 pytest tests/ -v
 ```
 
 ### Test Categories:
+- **`tests/security/test_priority3_audit.py`** (18 tests): Prometheus `/metrics` access protection (fail-closed in production, `x-admin-key`, `x-metrics-key`, Bearer token, and `METRICS_ALLOWED_CIDRS` allowlisting, constant-time UTF-8 byte comparison), multi-worker metrics aggregation via Redis atomic counters, process-local telemetry attribution tagged with worker PID, graceful fallback labeling (`scope="process"`) when Redis is unavailable, genuine multi-stage Dockerfile build structure, unexposed internal Redis port in `docker-compose.yml`, and restricted `TRUSTED_PROXIES` configuration.
 - **`tests/security/test_priority2_audit.py`** (35 tests): Consistent configuration snapshots in `check_limit()` and fallback paths under `self._lock` (eliminating torn reads), transactional integrity and thread safety of `RateLimiter.configure()` (rejecting partial mutations and verifying Redis arguments/telemetry parity), concurrent `max_local_keys` cache cleanup, server-controlled request costs (elimination of public `tokens` query parameters, ensuring strictly 1.0 token consumed per request and preventing fractional quota evasion), oversized token request handling (raising `ValueError` / returning HTTP 400 Bad Request on `tokens > capacity`, never HTTP 429), complete backward-clock and recovery sequence testing across Redis Lua and local fallback (preventing artificial refills via monotonic `effective_now`), dynamic startup configuration synchronization via `sync_rate_limiter_configuration()`, telemetry precision (`RateLimitResult.limit` float preservation), and clear distinction between burst capacity and sustained refill rate in API responses and headers.
 - **`tests/security/test_admin_protection.py`** (15 tests): Admin key enforcement (fail-closed, missing/empty key denial, invalid key denial, valid key acceptance, UTF-8 byte constant-time comparison to prevent timing attacks and avoid 500 errors on non-ASCII input, single environment variable authoritative source with no stale global fallback, error message neutrality, production startup validation for existence/length/entropy/placeholders).
 - **`tests/security/test_priority1_audit.py`** (43 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy (Shannon entropy & diversity vs length), known placeholder blocklist, strict boolean configuration parsing, startup configuration validation through FastAPI lifespan, production vs development environment isolation, prohibition of unauthenticated headers in production, and identity anti-spoofing.

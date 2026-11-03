@@ -17,8 +17,14 @@ from rate_limiter import (
     validate_rate_limiter_configuration
 )
 from spam_detector import AdaptiveSpamDetector
-from ip_utils import resolve_client_ip, parse_trusted_proxies
-from auth import get_authenticated_principal, AuthenticatedPrincipal, validate_auth_configuration
+from ip_utils import resolve_client_ip, parse_trusted_proxies, is_ip_trusted
+from auth import (
+    get_authenticated_principal,
+    AuthenticatedPrincipal,
+    validate_auth_configuration,
+    is_production_env,
+    parse_bool_env
+)
 from metrics import metrics_collector
 
 
@@ -78,6 +84,9 @@ ip_limiter = RateLimiter(
 # Initialize Self-Learning Spam & Abuse Detector
 detector = AdaptiveSpamDetector(redis_client=limiter.redis)
 
+# Connect Prometheus metrics collector to Redis for atomic cluster-wide aggregation
+metrics_collector.set_redis(limiter.redis)
+
 
 def sync_rate_limiter_configuration() -> None:
     """
@@ -88,6 +97,7 @@ def sync_rate_limiter_configuration() -> None:
     user_cap, user_refill, ip_cap, ip_refill, f_mode = validate_rate_limiter_configuration()
     limiter.configure(capacity=user_cap, refill_rate=user_refill, failure_mode=f_mode)
     ip_limiter.configure(capacity=ip_cap, refill_rate=ip_refill, failure_mode=f_mode)
+    metrics_collector.set_redis(limiter.redis)
 
 
 def format_token_limit(val: float) -> str:
@@ -134,6 +144,91 @@ def verify_admin_key(x_admin_key: Optional[str] = Header(None, alias="x-admin-ke
 
     return True
 
+
+def verify_metrics_access(
+    request: Request,
+    x_admin_key: Optional[str] = Header(None, alias="x-admin-key"),
+    x_metrics_key: Optional[str] = Header(None, alias="x-metrics-key"),
+    authorization: Optional[str] = Header(None, alias="authorization")
+) -> bool:
+    """
+    Controls access to the /metrics endpoint (Priority 3, Item 9).
+
+    Security Policy:
+      1. Production Environment (ENVIRONMENT=production or default):
+         - Access is strictly protected (fail-closed).
+         - Clients must authenticate via x-admin-key, x-metrics-key, Bearer token,
+           or originate from an allowed network CIDR (METRICS_ALLOWED_CIDRS).
+      2. Development/Test Environment:
+         - If PROTECT_METRICS=true is explicitly set, enforces authentication.
+         - If PROTECT_METRICS=false (or unset in dev/test), permits unauthenticated access for local scraping.
+      3. Credential Evaluation:
+         - Compares supplied keys against METRICS_API_KEY (if configured) or ADMIN_API_KEY.
+         - Constant-time comparison using UTF-8 byte encoding prevents timing attacks and handles non-ASCII gracefully.
+         - Does not leak key configuration details in error messages.
+      4. Network Policy:
+         - If METRICS_ALLOWED_CIDRS is configured, requests from IPs within these subnets are authorized.
+    """
+    is_prod = is_production_env()
+    protect_metrics = parse_bool_env("PROTECT_METRICS", default=True if is_prod else False)
+
+    if is_prod and not protect_metrics:
+        # Insecure production configuration: fail closed immediately
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: metrics protection cannot be disabled in production."
+        )
+
+    if not protect_metrics:
+        return True
+
+    # 1. Network allowlist check (METRICS_ALLOWED_CIDRS)
+    allowed_cidrs_str = os.getenv("METRICS_ALLOWED_CIDRS", "").strip()
+    if allowed_cidrs_str:
+        allowed_networks = parse_trusted_proxies(allowed_cidrs_str)
+        client_ip = resolve_client_ip(request, trusted_networks=TRUSTED_PROXIES)
+        if is_ip_trusted(client_ip, allowed_networks):
+            return True
+
+    # 2. Extract supplied key from headers
+    supplied_key = None
+    if x_metrics_key and x_metrics_key.strip():
+        supplied_key = x_metrics_key.strip()
+    elif x_admin_key and x_admin_key.strip():
+        supplied_key = x_admin_key.strip()
+    elif authorization and authorization.strip():
+        parts = authorization.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in ("bearer", "apikey"):
+            supplied_key = parts[1].strip()
+
+    if not supplied_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: invalid or missing metrics credentials."
+        )
+
+    # 3. Candidate keys: METRICS_API_KEY (if set) and ADMIN_API_KEY (if set)
+    metrics_key = os.getenv("METRICS_API_KEY", "").strip()
+    admin_key = os.getenv("ADMIN_API_KEY", "").strip()
+
+    supplied_bytes = supplied_key.encode("utf-8")
+
+    authorized = False
+    if metrics_key:
+        if hmac.compare_digest(supplied_bytes, metrics_key.encode("utf-8")):
+            authorized = True
+    if not authorized and admin_key:
+        if hmac.compare_digest(supplied_bytes, admin_key.encode("utf-8")):
+            authorized = True
+
+    if not authorized:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: invalid or missing metrics credentials."
+        )
+
+    return True
+
 # -----------------------------------------------------------------------------
 # Models
 # -----------------------------------------------------------------------------
@@ -164,8 +259,11 @@ def root():
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
-def get_metrics():
-    """Exposes system telemetry, request counters, and cluster health in Prometheus exposition format."""
+def get_metrics(authorized: bool = Depends(verify_metrics_access)):
+    """
+    Exposes system telemetry, request counters, and cluster health in Prometheus exposition format.
+    Protected according to the metrics security policy (Priority 3, Item 9).
+    """
     return metrics_collector.generate_prometheus_output(limiter=limiter, detector=detector)
 
 

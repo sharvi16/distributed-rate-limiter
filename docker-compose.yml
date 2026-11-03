@@ -2,13 +2,25 @@ services:
   redis:
     image: redis:7-alpine
     container_name: rate_limiter_redis
-    ports:
-      - "6379:6379"
+    # Operational Security (Priority 3, Item 11):
+    # Port 6379 is NOT exposed publicly on 0.0.0.0 by default to prevent unauthorized access.
+    # It is reachable exclusively by the 'api' container across the internal 'rate_limiter_net' bridge network.
+    # ports:
+    #   - "127.0.0.1:6379:6379"  # For local debugging only; never bind 0.0.0.0:6379 in production.
     volumes:
       - redis_data:/data
-    command: ["redis-server", "--appendonly", "yes"]
+    command: >
+      sh -c "
+        if [ -n \"$$REDIS_PASSWORD\" ]; then
+          exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\"
+        else
+          exec redis-server --appendonly yes
+        fi
+      "
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -a \"$$REDIS_PASSWORD\" ping; else redis-cli ping; fi"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -24,10 +36,16 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - RATE_LIMITER_FAILURE_MODE=fail_closed
-      - TRUSTED_PROXIES=127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      # Restrict trusted proxies strictly to actual reverse proxies / loopback (never blanket RFC1918 CIDRs)
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-127.0.0.1,::1}
+      - REQUIRE_AUTH=${REQUIRE_AUTH:-true}
+      - AUTH_SECRET_KEY=${AUTH_SECRET_KEY:-}
       - ADMIN_API_KEY=${ADMIN_API_KEY:-}
+      - PROTECT_METRICS=${PROTECT_METRICS:-true}
+      - METRICS_API_KEY=${METRICS_API_KEY:-}
     depends_on:
       redis:
         condition: service_healthy
