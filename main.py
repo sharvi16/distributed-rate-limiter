@@ -9,6 +9,7 @@ import redis
 from rate_limiter import RateLimiter, FailureMode, RedisUnavailableError
 from spam_detector import AdaptiveSpamDetector
 from ip_utils import resolve_client_ip, parse_trusted_proxies
+from auth import get_authenticated_principal, AuthenticatedPrincipal, verify_signed_token, REQUIRE_AUTH
 from metrics import metrics_collector
 
 app = FastAPI(
@@ -101,8 +102,7 @@ def get_metrics():
 def limited_resource(
     request: Request,
     response: Response,
-    user_id_dash: Optional[str] = Header(None, alias="user-id"),
-    user_id_underscore: Optional[str] = Header(None, alias="user_id"),
+    principal: AuthenticatedPrincipal = Depends(get_authenticated_principal),
     user_agent: Optional[str] = Header("", alias="user-agent")
 ):
     """
@@ -116,18 +116,13 @@ def limited_resource(
          - 'suspicious': Serves challenge (403). Solving challenge trains model that user is human.
          - 'human': Evaluated by Token Bucket (10 requests/min).
     """
-    raw_user_id = user_id_dash or user_id_underscore
-    user_id = raw_user_id.strip() if raw_user_id else ""
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Header 'user-id' (or 'user_id') is required."
-        )
+    # Rate limit identity is derived strictly from the authenticated principal
+    user_id = principal.user_id
 
     # Extract client IP address securely (supports trusted reverse proxies)
     client_ip = resolve_client_ip(request, trusted_networks=TRUSTED_PROXIES)
 
-    # Extract deterministic Device Fingerprint (Hardware Signature)
+    # Extract heuristic Device Fingerprint from untrusted client telemetry (headers)
     device_id = detector.compute_device_fingerprint(request.headers, user_agent=user_agent or "")
 
     # -------------------------------------------------------------------------
@@ -196,7 +191,10 @@ def limited_resource(
     try:
         ip_allowed = ip_limiter.is_allowed(f"ip:{client_ip}")
     except (redis.RedisError, RedisUnavailableError):
-        ip_allowed = True
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Rate limiter service unavailable (Redis down)"
+        )
 
     if not ip_allowed:
         metrics_collector.inc_request("rate_limited")
@@ -315,16 +313,43 @@ def limited_resource(
 
 
 @app.post("/verify-challenge")
-def verify_challenge(payload: ChallengeVerificationRequest, user_id_header: Optional[str] = Header(None, alias="user-id")):
+def verify_challenge(
+    payload: ChallengeVerificationRequest,
+    authorization: Optional[str] = Header(None, alias="authorization"),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+    user_id_header: Optional[str] = Header(None, alias="user-id")
+):
     """
     Submits an answer to a verification challenge.
     
-    Self-Learning Impact:
-      - If answer is correct: The model learns that this bursty traffic pattern belonged to a HUMAN,
-        updating its internal Gaussian centroids online!
-      - If answer is incorrect: The model learns the pattern belonged to a SPAMMER and jails the user.
+    Requires a valid authenticated identity (via Bearer token, API key, or user-id header in dev mode).
+    Binds challenge verification strictly to the authenticated principal to prevent identity hijacking.
     """
-    effective_user_id = (payload.user_id or user_id_header or "").strip()
+    effective_user_id = ""
+    if authorization:
+        parts = authorization.strip().split(maxsplit=1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            effective_user_id = verify_signed_token(parts[1].strip()) or ""
+            if not effective_user_id:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token.")
+        else:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Malformed Authorization header.")
+    elif x_api_key:
+        effective_user_id = verify_signed_token(x_api_key.strip()) or ""
+        if not effective_user_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key.")
+    elif REQUIRE_AUTH:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication credentials required.")
+    else:
+        # Fallback in unauthenticated development mode
+        effective_user_id = (payload.user_id or user_id_header or "").strip()
+
+    if not effective_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Challenge verification requires a valid authenticated identity."
+        )
+
     success, message = detector.verify_challenge(payload.challenge_id, payload.answer, expected_user_id=effective_user_id)
     if not success:
         raise HTTPException(

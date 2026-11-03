@@ -86,7 +86,7 @@ class AdaptiveSpamDetector:
                     return {"EXPIRED_OR_NOT_FOUND", "", "", 0}
                 end
 
-                if expected_user_id ~= "" and expected_user_id ~= user_id then
+                if expected_user_id == "" or expected_user_id ~= user_id then
                     return {"USER_MISMATCH", user_id, "", attempts_left or 0}
                 end
 
@@ -575,6 +575,8 @@ class AdaptiveSpamDetector:
         """
         user_answer_str = str(user_answer).strip()
         expected_user_str = str(expected_user_id or "").strip()
+        if not expected_user_str:
+            return False, "Challenge verification requires a valid user identity." 
 
         # 1. Distributed Redis Path (Atomic Lua Verification)
         if self.redis and self._verify_challenge_script:
@@ -628,7 +630,7 @@ class AdaptiveSpamDetector:
                 return False, "Challenge expired. Please request a new one."
 
             user_id = challenge["user_id"]
-            if expected_user_str and expected_user_str != user_id:
+            if not expected_user_str or expected_user_str != user_id:
                 return False, "Challenge was issued to a different user session."
 
             features = challenge["features"]
@@ -691,8 +693,15 @@ class AdaptiveSpamDetector:
 
     def compute_device_fingerprint(self, headers: Any, user_agent: str = "") -> str:
         """
-        Derives a deterministic Device Fingerprint based on hardware/client parameters
-        or an explicit device-id header from a mobile/browser client.
+        Derives a heuristic Device Fingerprint based on untrusted client telemetry
+        (browser headers and optional client-provided device ID).
+
+        SECURITY NOTICE:
+        HTTP request headers and device IDs are entirely client-controlled untrusted
+        telemetry. They are NOT tamper-resistant or cryptographically secure, and CANNOT
+        provide verified hardware identity. This fingerprint serves strictly as a heuristic
+        anomaly detection signal (e.g. for statistical VPN-hopping clustering) and MUST NEVER
+        be used as an authentication mechanism.
         """
         import hashlib
         explicit_id = str(headers.get("device-id") or headers.get("x-device-id") or "").strip()
