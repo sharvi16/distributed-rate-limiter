@@ -74,17 +74,21 @@ Production deployments strictly require cryptographic authentication (`REQUIRE_A
 4. **Anti-Spoofing & Unified Endpoints**:
    - Both `/limited-resource` and `/verify-challenge` share the exact same `get_authenticated_principal` dependency.
    - When an authenticated token is present, any client-supplied `user-id` header or body payload is ignored. The rate-limiting and challenge-verification identity is derived exclusively from the verified principal.
-5. **Entropy Validation (Length is Not Entropy)**:
+5. **Strict Production Environment Isolation**:
+   - In production (`ENVIRONMENT=production` or default), client-provided `user-id` headers are **ALWAYS prohibited**, regardless of other flags.
+   - `ALLOW_UNAUTHENTICATED_DEV_HEADERS=true` is strictly rejected at startup in production.
+   - Development-only client headers require explicit non-production configuration (`ENVIRONMENT=development` and `REQUIRE_AUTH=false` and `ALLOW_UNAUTHENTICATED_DEV_HEADERS=true`).
+6. **Entropy Validation (Length is Not Entropy)**:
    - `AUTH_SECRET_KEY` must have a minimum length of 32 characters (256 bits).
    - In production, keys must contain securely generated random material: minimum 10 unique symbols and Shannon entropy $\ge 3.0$ bits/symbol. Trivial keys (such as `"x" * 32` or `"01" * 16`) and known documentation placeholders are rejected.
    - Generate a secure key with:
      ```bash
      python -c "import secrets; print(secrets.token_hex(32))"
      ```
-6. **Strict Boolean Configuration Parsing**:
+7. **Strict Boolean Configuration Parsing**:
    - Configuration options like `REQUIRE_AUTH` and `ALLOW_UNAUTHENTICATED_DEV_HEADERS` strictly accept recognized boolean tokens (`true`, `false`, `1`, `0`, `yes`, `no`). Typos (e.g. `REQUIRE_AUTH=treu`) immediately fail startup rather than silently defaulting to insecure states.
-7. **Startup-Time Lifespan Validation**:
-   - Validation occurs eagerly during FastAPI application initialization (`lifespan`), halting process launch immediately on configuration errors before traffic can be received. Secrets are never logged.
+8. **Startup-Time Lifespan Validation**:
+   - Validation occurs eagerly during FastAPI application initialization (`lifespan`), halting process launch immediately on configuration errors or contradictory settings before traffic can be received. Secrets are never logged.
 
 ---
 
@@ -191,14 +195,14 @@ The stack launches:
 
 ## 🧪 Comprehensive Automated Test Suite
 
-The test suite contains **87 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
+The test suite contains **94 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
 
 ```bash
 pytest tests/ -v
 ```
 
 ### Test Categories:
-- **`tests/security/test_priority1_audit.py`** (36 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy (Shannon entropy & diversity vs length), known placeholder blocklist, strict boolean configuration parsing, startup configuration validation through FastAPI lifespan, production authentication defaults, and identity anti-spoofing.
+- **`tests/security/test_priority1_audit.py`** (43 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy (Shannon entropy & diversity vs length), known placeholder blocklist, strict boolean configuration parsing, startup configuration validation through FastAPI lifespan, production vs development environment isolation, prohibition of unauthenticated headers in production, and identity anti-spoofing.
 - **`tests/unit/test_token_bucket.py`** (11 tests): Capacity, refill math, oversized requests, atomic concurrency, failure modes (`fail_closed`, `fail_open`, `local_fallback`), and RFC headers.
 - **`tests/unit/test_challenge.py`** (8 tests): Cryptographic ID generation, single-use enforcement, attempt exhaustion, user-session binding, and answer leak prevention.
 - **`tests/integration/test_model_sync.py`** (4 tests): Gaussian centroid persistence across restarts, cross-instance synchronization, and atomic EMA Lua updates.

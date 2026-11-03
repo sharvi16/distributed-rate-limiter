@@ -6,7 +6,8 @@ Provides strict HMAC-SHA256 signed bearer token authentication with:
   - Configurable token expiration (default: 3600 seconds / 1 hour).
   - Clock-skew window validation for future timestamps.
   - Zero support for forged or unsigned plaintext tokens (e.g. token_*, usr_*).
-  - Secure-by-default production enforcement (REQUIRE_AUTH=true default).
+  - Secure-by-default production enforcement (REQUIRE_AUTH=true default, ENVIRONMENT=production default).
+  - Strict prohibition of unauthenticated client-provided identity headers in production.
   - Strict boolean environment variable parsing (typos like 'treu' raise errors, never silently bypass).
   - Cryptographic entropy validation on AUTH_SECRET_KEY (minimum 32 bytes / 256 bits of random material,
     Shannon entropy >= 3.0 bits/symbol, minimum 10 unique symbols, blocklist for known placeholders).
@@ -35,6 +36,24 @@ KNOWN_INSECURE_SECRETS = {
     "change-me-in-production-secret-key-min-32-chars",
     "test-secret-key-with-sufficient-length-32-characters",
 }
+
+
+def get_environment() -> str:
+    """
+    Returns the normalized environment name.
+    Defaults to 'production' if not explicitly configured.
+    """
+    return os.getenv("ENVIRONMENT", "production").strip().lower()
+
+
+def is_production_env() -> bool:
+    """
+    Returns True if the application is running in production.
+    Secure-by-default: Any environment other than explicit 'development', 'dev', 'test', 'testing', 'local'
+    is treated strictly as production.
+    """
+    env = get_environment()
+    return env in ("production", "prod") or env not in ("development", "dev", "test", "testing", "local")
 
 
 def calculate_shannon_entropy(data: str) -> float:
@@ -87,13 +106,22 @@ def is_auth_required() -> bool:
 def is_dev_headers_allowed() -> bool:
     """
     Returns True only when unauthenticated client-provided 'user-id' headers are
-    explicitly permitted via ALLOW_UNAUTHENTICATED_DEV_HEADERS=true AND REQUIRE_AUTH=false.
-    Never silently enabled in production.
-    Strictly validates boolean format and raises ValueError on typos.
+    explicitly permitted in a non-production development/test environment.
+
+    Security Rules:
+      1. If running in production (ENVIRONMENT=production or default), ALWAYS returns False,
+         regardless of other environment variable settings.
+      2. In development/test, requires BOTH REQUIRE_AUTH=false AND ALLOW_UNAUTHENTICATED_DEV_HEADERS=true.
+      3. Otherwise returns False.
     """
-    dev_allowed = parse_bool_env("ALLOW_UNAUTHENTICATED_DEV_HEADERS", default=False)
+    # Production environments strictly prohibit unauthenticated client identity headers
+    if is_production_env():
+        return False
+
     if is_auth_required():
         return False
+
+    dev_allowed = parse_bool_env("ALLOW_UNAUTHENTICATED_DEV_HEADERS", default=False)
     return dev_allowed
 
 
@@ -113,8 +141,8 @@ def get_auth_secret_key() -> str:
     """
     key = os.getenv("AUTH_SECRET_KEY", "").strip()
 
-    is_dev_env = os.getenv("ENVIRONMENT", "").strip().lower() in ("development", "test", "testing")
-    allow_dev = is_dev_headers_allowed() or is_dev_env
+    is_prod = is_production_env()
+    allow_dev = not is_prod
 
     if not key:
         if allow_dev:
@@ -163,13 +191,40 @@ def validate_auth_configuration() -> None:
     
     Aborts startup immediately if:
       - Boolean flags have invalid syntax (e.g., REQUIRE_AUTH=treu).
-      - In production, AUTH_SECRET_KEY is missing, weak, low-entropy, or a known placeholder.
+      - Contradictory security settings are detected (e.g. REQUIRE_AUTH=true AND ALLOW_UNAUTHENTICATED_DEV_HEADERS=true).
+      - In production:
+        * REQUIRE_AUTH is set to false.
+        * ALLOW_UNAUTHENTICATED_DEV_HEADERS is set to true.
+        * AUTH_SECRET_KEY is missing, weak (< 32 chars), low-entropy (< 3.0 bits or < 10 unique symbols), or a known placeholder.
     """
     # 1. Validate boolean configurations (throws ValueError on invalid formats like 'treu')
-    is_auth_required()
-    is_dev_headers_allowed()
+    req_auth = is_auth_required()
+    dev_headers_flag = parse_bool_env("ALLOW_UNAUTHENTICATED_DEV_HEADERS", default=False)
 
-    # 2. Validate secret key (throws RuntimeError if missing, ValueError if weak/low-entropy)
+    # 2. Reject contradictory configuration settings
+    if req_auth and dev_headers_flag:
+        raise ValueError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: Contradictory security settings: "
+            "ALLOW_UNAUTHENTICATED_DEV_HEADERS cannot be set to true when REQUIRE_AUTH is true. "
+            "Unauthenticated identity headers are prohibited when authentication is required."
+        )
+
+    # 3. Enforce strict production requirements
+    if is_production_env():
+        if not req_auth:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: Insecure production configuration: "
+                "REQUIRE_AUTH cannot be set to false in a production environment. "
+                "Cryptographic authentication is mandatory in production."
+            )
+        if dev_headers_flag:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: Insecure production configuration: "
+                "ALLOW_UNAUTHENTICATED_DEV_HEADERS cannot be set to true in a production environment. "
+                "Unauthenticated client-provided identity headers are strictly prohibited in production."
+            )
+
+    # 4. Validate secret key (throws RuntimeError if missing, ValueError if weak/low-entropy/placeholder)
     get_auth_secret_key()
 
 
@@ -289,8 +344,9 @@ def get_authenticated_principal(
          - ANY client-provided 'user-id' or 'user_id' header is STRICTLY IGNORED.
          - Invalid or expired tokens return 401 Unauthorized.
       2. If no credentials are provided:
-         - Under default production settings (REQUIRE_AUTH=true): Rejects with 401 Unauthorized.
-         - Under explicit dev override (ALLOW_UNAUTHENTICATED_DEV_HEADERS=true and REQUIRE_AUTH=false):
+         - Under default production settings (REQUIRE_AUTH=true, ENVIRONMENT=production):
+           Rejects with 401 Unauthorized.
+         - Under explicit dev override in development/test (ALLOW_UNAUTHENTICATED_DEV_HEADERS=true and REQUIRE_AUTH=false):
            Accepts 'user-id' header with is_authenticated=False.
     """
     # 1. Evaluate Authorization: Bearer <token>

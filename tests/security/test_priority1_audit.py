@@ -9,8 +9,9 @@ Covers:
   5. Strict boolean environment configuration validation (typos like 'treu' fail startup).
   6. Startup-time configuration validation via validate_auth_configuration() and FastAPI lifespan.
   7. Production authentication defaults (REQUIRE_AUTH=true, 401 rejection, dev header lockdown).
-  8. Identity trust & anti-spoofing across both /limited-resource and /verify-challenge endpoints.
-  9. Device fingerprinting limitations: verifying header-derived heuristic nature.
+  8. Production vs Development environment isolation (ENVIRONMENT=production ALWAYS prohibits unauthenticated identity headers).
+  9. Identity trust & anti-spoofing across both /limited-resource and /verify-challenge endpoints.
+ 10. Device fingerprinting limitations: verifying header-derived heuristic nature.
 """
 
 import time
@@ -29,6 +30,7 @@ from auth import (
     get_auth_secret_key,
     is_auth_required,
     is_dev_headers_allowed,
+    is_production_env,
     parse_bool_env,
     calculate_shannon_entropy,
     validate_auth_configuration,
@@ -355,6 +357,8 @@ class TestSigningSecretSecurityAndEntropy:
     def test_strong_random_signing_secret_accepted(self, monkeypatch):
         """A cryptographically random 256-bit key (e.g. 64 hex characters) is valid and accepted."""
         strong_key = secrets.token_hex(32)
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
         monkeypatch.setenv("AUTH_SECRET_KEY", strong_key)
         assert get_auth_secret_key() == strong_key
 
@@ -444,7 +448,171 @@ class TestStartupConfigurationValidation:
 
 
 # =============================================================================
-# 7. Production Authentication Defaults & Endpoint Enforcement
+# 7. Production vs Development Environment Isolation & Header Prohibition
+# =============================================================================
+class TestProductionDevHeaderProhibitionAndEnvironmentIsolation:
+    def test_production_rejects_require_auth_false(self, monkeypatch):
+        """In production, REQUIRE_AUTH=false must always be rejected by startup validation."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("AUTH_SECRET_KEY", secrets.token_hex(32))
+
+        assert is_dev_headers_allowed() is False
+        with pytest.raises(ValueError) as exc_info:
+            validate_auth_configuration()
+        assert "REQUIRE_AUTH cannot be set to false in a production environment" in str(exc_info.value)
+
+    def test_production_rejects_allow_unauthenticated_dev_headers_true(self, monkeypatch):
+        """In production, ALLOW_UNAUTHENTICATED_DEV_HEADERS=true must always be rejected by startup validation."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "true")
+        monkeypatch.setenv("AUTH_SECRET_KEY", secrets.token_hex(32))
+
+        assert is_dev_headers_allowed() is False
+        with pytest.raises(ValueError) as exc_info:
+            validate_auth_configuration()
+        assert "Contradictory security settings" in str(exc_info.value) or "ALLOW_UNAUTHENTICATED_DEV_HEADERS cannot be set to true in a production environment" in str(exc_info.value)
+
+    def test_production_all_four_flag_combinations(self, monkeypatch):
+        """
+        Tests all 4 combinations of (REQUIRE_AUTH, ALLOW_UNAUTHENTICATED_DEV_HEADERS) in production.
+        Only (True, False) is valid. All other 3 are strictly rejected.
+        """
+        valid_key = secrets.token_hex(32)
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("AUTH_SECRET_KEY", valid_key)
+
+        # Combo 1: (False, False) -> Rejected
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        assert is_dev_headers_allowed() is False
+        with pytest.raises(ValueError):
+            validate_auth_configuration()
+
+        # Combo 2: (False, True) -> Rejected
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "true")
+        assert is_dev_headers_allowed() is False
+        with pytest.raises(ValueError):
+            validate_auth_configuration()
+
+        # Combo 3: (True, True) -> Rejected (contradictory)
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "true")
+        assert is_dev_headers_allowed() is False
+        with pytest.raises(ValueError):
+            validate_auth_configuration()
+
+        # Combo 4: (True, False) -> Succeeded!
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        assert is_dev_headers_allowed() is False
+        validate_auth_configuration()  # Must not raise
+
+    def test_development_with_explicit_opt_in_succeeds(self, client, monkeypatch):
+        """In development with explicit opt-in (REQUIRE_AUTH=false and ALLOW_UNAUTHENTICATED_DEV_HEADERS=true), client headers are allowed."""
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "true")
+
+        assert is_dev_headers_allowed() is True
+        validate_auth_configuration()  # Startup check succeeds
+
+        dev_user = f"dev_user_{uuid.uuid4().hex[:6]}"
+        response = client.get("/limited-resource", headers={"user-id": dev_user})
+        assert response.status_code == 200
+        assert response.json()["user_id"] == dev_user
+
+    def test_development_without_explicit_opt_in_rejects_client_headers(self, client, monkeypatch):
+        """In development without explicit opt-in, client headers are strictly rejected with 401."""
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("AUTH_SECRET_KEY", secrets.token_hex(32))
+
+        assert is_dev_headers_allowed() is False
+
+        # Request with client-supplied user-id must return 401 Unauthorized
+        response = client.get("/limited-resource", headers={"user-id": "unauthorized_dev_user"})
+        assert response.status_code == 401
+
+        # Also when REQUIRE_AUTH=false but ALLOW_UNAUTHENTICATED_DEV_HEADERS=false
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        assert is_dev_headers_allowed() is False
+        res2 = client.get("/limited-resource", headers={"user-id": "unauthorized_dev_user"})
+        assert res2.status_code == 401
+
+    def test_test_environment_retains_intended_behavior(self, client, monkeypatch):
+        """Test environment preserves existing test fixture capability for integration testing."""
+        monkeypatch.setenv("ENVIRONMENT", "test")
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "true")
+
+        assert is_dev_headers_allowed() is True
+        validate_auth_configuration()
+
+        test_user = f"test_harness_{uuid.uuid4().hex[:6]}"
+        response = client.get("/limited-resource", headers={"user-id": test_user})
+        assert response.status_code == 200
+        assert response.json()["user_id"] == test_user
+
+    def test_production_startup_rejects_every_insecure_configuration(self, monkeypatch):
+        """FastAPI lifespan aborts startup on any insecure configuration in production."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+
+        # 1. Missing secret key
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.delenv("AUTH_SECRET_KEY", raising=False)
+        with pytest.raises(RuntimeError):
+            with TestClient(app):
+                pass
+
+        # 2. Weak secret key (< 32 chars)
+        monkeypatch.setenv("AUTH_SECRET_KEY", "too-short")
+        with pytest.raises(ValueError):
+            with TestClient(app):
+                pass
+
+        # 3. Low-entropy secret key ('x' * 32)
+        monkeypatch.setenv("AUTH_SECRET_KEY", "x" * 32)
+        with pytest.raises(ValueError):
+            with TestClient(app):
+                pass
+
+        # 4. Insecure placeholder secret
+        monkeypatch.setenv("AUTH_SECRET_KEY", "replace-with-a-secure-random-secret-key-at-least-32-chars-long")
+        with pytest.raises(ValueError):
+            with TestClient(app):
+                pass
+
+        # 5. REQUIRE_AUTH=false in production
+        monkeypatch.setenv("AUTH_SECRET_KEY", secrets.token_hex(32))
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        with pytest.raises(ValueError):
+            with TestClient(app):
+                pass
+
+        # 6. ALLOW_UNAUTHENTICATED_DEV_HEADERS=true in production
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "true")
+        with pytest.raises(ValueError):
+            with TestClient(app):
+                pass
+
+        # 7. Typo in boolean config
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("REQUIRE_AUTH", "treu")
+        with pytest.raises(ValueError):
+            with TestClient(app):
+                pass
+
+
+# =============================================================================
+# 8. Production Authentication Defaults & Endpoint Enforcement
 # =============================================================================
 class TestProductionAuthDefaultsAndEndpointEnforcement:
     def test_default_production_auth_requirement(self, monkeypatch):
@@ -536,7 +704,7 @@ class TestProductionAuthDefaultsAndEndpointEnforcement:
 
 
 # =============================================================================
-# 8. Device Fingerprint Heuristic Verification
+# 9. Device Fingerprint Heuristic Verification
 # =============================================================================
 class TestDeviceFingerprintHeuristicLimitations:
     def test_fingerprint_changes_with_untrusted_client_headers(self):

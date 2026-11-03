@@ -44,3 +44,4 @@ jobs:
           AUTH_SECRET_KEY: "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e"
         run: |
           pytest tests/ -v
+
