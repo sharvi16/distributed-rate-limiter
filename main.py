@@ -1,5 +1,5 @@
 from fastapi.responses import PlainTextResponse
-from fastapi import FastAPI, Header, HTTPException, status, Request, Response, Depends
+from fastapi import FastAPI, Header, HTTPException, status, Request, Response, Depends, Query
 from contextlib import asynccontextmanager
 import math
 import hmac
@@ -8,7 +8,14 @@ from typing import Optional, Dict, Any
 import os
 import redis
 
-from rate_limiter import RateLimiter, FailureMode, RedisUnavailableError
+from rate_limiter import (
+    RateLimiter,
+    FailureMode,
+    RedisUnavailableError,
+    validate_tokens_requested,
+    parse_env_positive_float,
+    validate_rate_limiter_configuration
+)
 from spam_detector import AdaptiveSpamDetector
 from ip_utils import resolve_client_ip, parse_trusted_proxies
 from auth import get_authenticated_principal, AuthenticatedPrincipal, validate_auth_configuration
@@ -19,10 +26,11 @@ from metrics import metrics_collector
 async def lifespan(app: FastAPI):
     """
     FastAPI lifespan handler executing startup configuration validation.
-    Ensures authentication, encryption keys, and environment variables are
-    verified before accepting incoming HTTP requests.
+    Ensures authentication, encryption keys, admin secrets, and rate limiter
+    environment variables are verified before accepting incoming HTTP requests.
     """
     validate_auth_configuration()
+    validate_rate_limiter_configuration()
     yield
 
 
@@ -45,19 +53,25 @@ try:
 except ValueError:
     configured_failure_mode = FailureMode.FAIL_CLOSED
 
-# Initialize Token Bucket Rate Limiter (10 requests per minute with in-memory fallback)
+# Read Token Bucket parameters from environment variables (Priority 2)
+user_capacity = parse_env_positive_float("RATE_LIMITER_CAPACITY", default=10.0)
+user_refill_rate = parse_env_positive_float("RATE_LIMITER_REFILL_RATE", default=10.0 / 60.0)
+ip_capacity = parse_env_positive_float("IP_RATE_LIMITER_CAPACITY", default=30.0)
+ip_refill_rate = parse_env_positive_float("IP_RATE_LIMITER_REFILL_RATE", default=30.0 / 60.0)
+
+# Initialize Token Bucket Rate Limiter
 limiter = RateLimiter(
     redis_url=redis_url,
-    capacity=10,
-    refill_rate=10.0 / 60.0,
+    capacity=user_capacity,
+    refill_rate=user_refill_rate,
     failure_mode=configured_failure_mode
 )
 
-# Initialize Outer IP Guardrail Rate Limiter (30 requests per minute per physical IP)
+# Initialize Outer IP Guardrail Rate Limiter
 ip_limiter = RateLimiter(
     redis_url=redis_url,
-    capacity=30,
-    refill_rate=30.0 / 60.0,
+    capacity=ip_capacity,
+    refill_rate=ip_refill_rate,
     failure_mode=configured_failure_mode
 )
 
@@ -137,7 +151,8 @@ def limited_resource(
     request: Request,
     response: Response,
     principal: AuthenticatedPrincipal = Depends(get_authenticated_principal),
-    user_agent: Optional[str] = Header("", alias="user-agent")
+    user_agent: Optional[str] = Header("", alias="user-agent"),
+    tokens: Optional[float] = Query(1.0, description="Tokens requested")
 ):
     """
     Adaptive Rate Limited & Abuse Protected Endpoint.
@@ -150,6 +165,15 @@ def limited_resource(
          - 'suspicious': Serves challenge (403). Solving challenge trains model that user is human.
          - 'human': Evaluated by Token Bucket (10 requests/min).
     """
+    # Validate requested tokens parameter (Priority 2)
+    try:
+        tokens_requested = validate_tokens_requested(tokens if tokens is not None else 1.0)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid tokens parameter: {e}"
+        )
+
     # Rate limit identity is derived strictly from the authenticated principal
     user_id = principal.user_id
 
@@ -223,29 +247,37 @@ def limited_resource(
     # Caps total traffic from the physical network, regardless of user accounts.
     # -------------------------------------------------------------------------
     try:
-        ip_allowed = ip_limiter.is_allowed(f"ip:{client_ip}")
+        ip_result = ip_limiter.check_limit(f"ip:{client_ip}", tokens=1)
     except (redis.RedisError, RedisUnavailableError):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Rate limiter service unavailable (Redis down)"
         )
 
-    if not ip_allowed:
+    if not ip_result.allowed:
         metrics_collector.inc_request("rate_limited")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
-                "message": "Physical IP rate limit exceeded (30 requests per minute across all accounts). Try again later.",
+                "message": f"Physical IP rate limit exceeded ({int(ip_limiter.capacity)} requests per minute across all accounts). Try again later.",
                 "client_ip": client_ip
             },
-            headers={"Retry-After": "60"}
+            headers={
+                "X-RateLimit-Limit": str(ip_result.limit),
+                "X-RateLimit-Remaining": str(max(0, int(ip_result.remaining))),
+                "X-RateLimit-Reset": str(math.ceil(ip_result.reset_after)),
+                "RateLimit-Limit": str(ip_result.limit),
+                "RateLimit-Remaining": str(max(0, int(ip_result.remaining))),
+                "RateLimit-Reset": str(math.ceil(ip_result.reset_after)),
+                "Retry-After": str(ip_result.retry_after or 1)
+            }
         )
 
     # -------------------------------------------------------------------------
-    # Tier 3: User Token Bucket Quota (10 requests / minute per user_id)
+    # Tier 3: User Token Bucket Quota
     # -------------------------------------------------------------------------
     try:
-        rate_result = limiter.check_limit(user_id)
+        rate_result = limiter.check_limit(user_id, tokens=tokens_requested)
     except (redis.RedisError, RedisUnavailableError):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -257,21 +289,27 @@ def limited_resource(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
-                "message": "Rate limit exceeded (10 requests per minute). Quota exhausted. Try again later.",
+                "message": f"Rate limit exceeded ({int(limiter.capacity)} requests per minute). Quota exhausted. Try again later.",
                 "user_id": user_id
             },
             headers={
                 "X-RateLimit-Limit": str(rate_result.limit),
                 "X-RateLimit-Remaining": str(max(0, int(rate_result.remaining))),
                 "X-RateLimit-Reset": str(math.ceil(rate_result.reset_after)),
+                "RateLimit-Limit": str(rate_result.limit),
+                "RateLimit-Remaining": str(max(0, int(rate_result.remaining))),
+                "RateLimit-Reset": str(math.ceil(rate_result.reset_after)),
                 "Retry-After": str(rate_result.retry_after or 1)
             }
         )
 
-    # Attach standard RFC rate limit headers to successful evaluation
+    # Attach standard RFC and IETF rate limit headers to successful evaluation
     response.headers["X-RateLimit-Limit"] = str(rate_result.limit)
     response.headers["X-RateLimit-Remaining"] = str(max(0, int(rate_result.remaining)))
     response.headers["X-RateLimit-Reset"] = str(math.ceil(rate_result.reset_after))
+    response.headers["RateLimit-Limit"] = str(rate_result.limit)
+    response.headers["RateLimit-Remaining"] = str(max(0, int(rate_result.remaining)))
+    response.headers["RateLimit-Reset"] = str(math.ceil(rate_result.reset_after))
 
     # If the user already has an unsolved challenge and continues hammering -> Auto-jail!
     if detector.has_pending_challenge(user_id):

@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import threading
 import json
 import redis
+from rate_limiter import validate_positive_number, validate_positive_int
 
 class AdaptiveSpamDetector:
     """
@@ -679,6 +680,7 @@ class AdaptiveSpamDetector:
         """Grants user a 5-minute Verified Human Pass after solving a challenge."""
         if not user_id:
             return
+        duration_seconds = int(validate_positive_number("duration_seconds", duration_seconds))
         if self.redis:
             try:
                 self.redis.setex(f"verified_human:{user_id}", duration_seconds, "verified")
@@ -760,6 +762,8 @@ class AdaptiveSpamDetector:
         within window_seconds, flags as a VPN Hopping / IP Churning attack.
         Returns (is_vpn_hopping, distinct_ip_count).
         """
+        max_allowed_ips = validate_positive_int("max_allowed_ips", max_allowed_ips)
+        window_seconds = validate_positive_number("window_seconds", window_seconds)
         if not device_id or not client_ip:
             return False, 1
 
@@ -802,6 +806,8 @@ class AdaptiveSpamDetector:
         flags as a Sybil attack.
         Returns (is_sybil_attack, distinct_id_count).
         """
+        max_allowed_ids = validate_positive_int("max_allowed_ids", max_allowed_ids)
+        window_seconds = validate_positive_number("window_seconds", window_seconds)
         if not client_ip or not user_id:
             return False, 1
 
@@ -844,6 +850,7 @@ class AdaptiveSpamDetector:
         """
         if not user_id:
             return
+        duration_seconds = int(validate_positive_number("duration_seconds", duration_seconds))
 
         # 1. Redis Atomic Jail Script
         if self.redis and getattr(self, "_jail_user_script", None):
@@ -888,6 +895,8 @@ class AdaptiveSpamDetector:
     def set_strikes(self, user_id: str, count: int):
         if not user_id:
             return
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"count must be a non-negative integer, got {count}")
         if self.redis:
             try:
                 self.redis.setex(f"strikes:{user_id}", 600, count)

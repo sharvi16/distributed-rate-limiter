@@ -2,9 +2,24 @@ from dataclasses import dataclass
 """
 Distributed Token Bucket Rate Limiter with Redis Lua Atomicity and Configurable Failure Modes.
 
-Architectural Guarantees:
-  1. Monotonic Server Time: Uses Redis server time via `redis.call('TIME')` inside the Lua script,
-     eliminating clock drift across distributed application nodes.
+Architectural Guarantees & Redis Time Semantics:
+  1. Redis Server Wall-Clock Time:
+     Uses Redis server time via `redis.call('TIME')` inside the Lua script.
+     - Non-Monotonic Wall-Clock Time: The Redis `TIME` command calls `gettimeofday()` on the
+       host operating system (CLOCK_REALTIME), which is NOT a guaranteed hardware monotonic
+       clock (CLOCK_MONOTONIC). It reflects wall-clock time and is subject to system clock
+       adjustments, NTP stepping or slewing, and leap seconds.
+     - Backward Jump Defense: To protect against negative elapsed time intervals caused by NTP steps
+       or backward clock shifts, the Lua script strictly clamps delta calculation:
+       `local delta = math.max(0, now - last_updated)`
+       ensuring accrued tokens cannot underflow or be erased by backward clock shifts.
+     - Clock Adjustment Assumptions: Production Redis instances should run NTP in slew mode (e.g.
+       using chrony with slewing or ntpd `-x`) to adjust time continuously rather than in abrupt steps.
+     - Failover & Replica Assumptions: In distributed Redis setups (Sentinel / Cluster), failover
+       promotion assumes replica host wall-clocks are synchronized with low skew (< a few milliseconds).
+       A promoted replica whose wall-clock lags behind will briefly pause refills until elapsed time
+       catches up; a promoted replica whose wall-clock is ahead will refill proportionally to the delta,
+       capped at total bucket capacity.
   2. Strict Atomicity: Token evaluation, refill calculation, consumption, and TTL expiration
      execute in a single atomic Lua transaction.
   3. Configurable Failure Modes:
@@ -18,9 +33,10 @@ Architectural Guarantees:
 
 from enum import Enum
 import math
+import os
 import threading
 import time
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 import redis
 
 
@@ -40,14 +56,120 @@ class RedisUnavailableError(RateLimiterError):
     """Raised when Redis is down and failure_mode is FAIL_CLOSED."""
     pass
 
+
 @dataclass
 class RateLimitResult:
+    """
+    Detailed telemetry resulting from a rate limit evaluation.
+
+    Attributes:
+        allowed (bool): True if the requested tokens were permitted and consumed;
+            False if remaining quota was insufficient.
+        limit (int): Maximum burst capacity of the token bucket.
+        remaining (float): Available tokens remaining in the bucket immediately
+            following evaluation.
+        reset_after (float): Relative duration in seconds until the bucket is completely
+            replenished back to its full maximum capacity: (capacity - remaining) / refill_rate.
+        retry_after (Optional[int]): Recommended wait duration in integer seconds for HTTP
+            Retry-After headers before retrying the rejected request:
+            max(1, ceil((tokens - remaining) / refill_rate)). Populated only when allowed=False;
+            None when allowed=True.
+    """
     allowed: bool
     limit: int
     remaining: float
     reset_after: float
     retry_after: Optional[int] = None
 
+
+# -----------------------------------------------------------------------------
+# Numeric Validation & Configuration Helpers (Priority 2)
+# -----------------------------------------------------------------------------
+
+def validate_positive_number(name: str, val: Any) -> float:
+    """
+    Validates that a numeric argument is a finite, strictly positive real number.
+    Explicitly rejects booleans, None, strings, NaN, and positive/negative infinity.
+    """
+    if isinstance(val, bool):
+        raise ValueError(f"{name} cannot be a boolean")
+    if not isinstance(val, (int, float)):
+        raise ValueError(f"{name} must be a number, got {type(val).__name__}")
+    if math.isnan(val):
+        raise ValueError(f"{name} cannot be NaN")
+    if math.isinf(val):
+        raise ValueError(f"{name} cannot be infinity")
+    if val <= 0:
+        raise ValueError(f"{name} must be a positive number, got {val}")
+    return float(val)
+
+
+def validate_positive_int(name: str, val: Any) -> int:
+    """
+    Validates that a numeric argument is a strictly positive integer.
+    Explicitly rejects booleans, non-integers, floats, None, strings, NaN, and infinity.
+    """
+    if isinstance(val, bool):
+        raise ValueError(f"{name} cannot be a boolean")
+    if not isinstance(val, int) or isinstance(val, float):
+        raise ValueError(f"{name} must be an integer, got {type(val).__name__}")
+    if val <= 0:
+        raise ValueError(f"{name} must be positive, got {val}")
+    return val
+
+
+def validate_tokens_requested(tokens: Any) -> float:
+    """
+    Validates requested tokens for rate limit checks.
+    Explicitly rejects booleans, None, strings, NaN, infinity, and values <= 0.
+    """
+    if isinstance(tokens, bool):
+        raise ValueError("tokens requested cannot be a boolean")
+    if not isinstance(tokens, (int, float)):
+        raise ValueError(f"tokens requested must be a number, got {type(tokens).__name__}")
+    if math.isnan(tokens):
+        raise ValueError("tokens requested cannot be NaN")
+    if math.isinf(tokens):
+        raise ValueError("tokens requested cannot be infinity")
+    if tokens <= 0:
+        raise ValueError(f"tokens requested must be greater than zero, got {tokens}")
+    return float(tokens)
+
+
+def parse_env_positive_float(var_name: str, default: float) -> float:
+    """
+    Safely parses an environment variable as a strictly positive finite float.
+    Rejects boolean strings, non-numeric strings, NaN, infinity, and values <= 0.
+    Falls back to default if unset or empty.
+    """
+    raw = os.getenv(var_name)
+    if raw is None or raw.strip() == "":
+        return default
+    raw_str = raw.strip()
+    if raw_str.lower() in ("true", "false", "yes", "no"):
+        raise ValueError(f"Environment variable {var_name} cannot be a boolean, got {raw!r}")
+    try:
+        val = float(raw_str)
+    except ValueError:
+        raise ValueError(f"Environment variable {var_name} must be a valid number, got {raw!r}")
+    if math.isnan(val):
+        raise ValueError(f"Environment variable {var_name} cannot be NaN")
+    if math.isinf(val):
+        raise ValueError(f"Environment variable {var_name} cannot be infinity")
+    if val <= 0:
+        raise ValueError(f"Environment variable {var_name} must be a positive number, got {val}")
+    return val
+
+
+def validate_rate_limiter_configuration():
+    """
+    Validates rate limiter environment variables at application startup.
+    Fails fast if RATE_LIMITER_CAPACITY or RATE_LIMITER_REFILL_RATE are invalid.
+    """
+    parse_env_positive_float("RATE_LIMITER_CAPACITY", default=10.0)
+    parse_env_positive_float("RATE_LIMITER_REFILL_RATE", default=10.0 / 60.0)
+    parse_env_positive_float("IP_RATE_LIMITER_CAPACITY", default=30.0)
+    parse_env_positive_float("IP_RATE_LIMITER_REFILL_RATE", default=30.0 / 60.0)
 
 
 class RateLimiter:
@@ -66,7 +188,9 @@ class RateLimiter:
     local refill_rate = tonumber(ARGV[2])
     local requested = tonumber(ARGV[3])
 
-    -- 1. Obtain monotonic time directly from Redis server (eliminates application clock skew)
+    -- 1. Obtain server wall-clock time from Redis (gettimeofday, CLOCK_REALTIME).
+    -- Note: Server wall-clock time eliminates client drift across distributed application nodes.
+    -- Any backward clock steps (e.g. from NTP adjustments) are strictly clamped below via math.max(0, ...).
     local time_val = redis.call('TIME')
     local now = tonumber(time_val[1]) + (tonumber(time_val[2]) / 1000000)
 
@@ -120,17 +244,10 @@ class RateLimiter:
         :param max_local_keys: Maximum entries in local memory fallback to avoid memory leaks.
         :param redis_client: Optional pre-configured Redis client instance (e.g. for testing).
         """
-        # Validate initialization invariants
-        if capacity <= 0:
-            raise ValueError(f"capacity must be a positive number, got {capacity}")
-        if refill_rate <= 0:
-            raise ValueError(f"refill_rate must be a positive number, got {refill_rate}")
-        if max_local_keys <= 0:
-            raise ValueError(f"max_local_keys must be positive, got {max_local_keys}")
-
-        self.capacity = float(capacity)
-        self.refill_rate = float(refill_rate)
-        self.max_local_keys = max_local_keys
+        # Validate initialization invariants (reject booleans, None, strings, NaN, infinity, <= 0)
+        self.capacity = validate_positive_number("capacity", capacity)
+        self.refill_rate = validate_positive_number("refill_rate", refill_rate)
+        self.max_local_keys = validate_positive_int("max_local_keys", max_local_keys)
         self.redis_url = redis_url
 
         # Backwards compatibility for legacy `enable_fallback` parameter
@@ -180,49 +297,48 @@ class RateLimiter:
             except Exception:
                 self.check_limit_script = None
 
-    def check_limit(self, user_id: str, tokens: int = 1) -> RateLimitResult:
-            """
-            Evaluates rate limit and returns detailed telemetry including remaining tokens,
-            reset duration, and retry-after guidance for RFC-compliant HTTP headers.
-            """
-            if not isinstance(user_id, str) or not user_id.strip():
-                raise ValueError("user_id must be a non-empty string")
-            user_id = user_id.strip()
-    
-            if not isinstance(tokens, (int, float)) or tokens <= 0:
-                raise ValueError(f"tokens requested must be greater than zero, got {tokens}")
-    
-            if tokens > self.capacity:
-                return RateLimitResult(
-                    allowed=False,
-                    limit=int(self.capacity),
-                    remaining=0.0,
-                    reset_after=self.capacity / self.refill_rate,
-                    retry_after=math.ceil(self.capacity / self.refill_rate)
+    def check_limit(self, user_id: str, tokens: Union[int, float] = 1) -> RateLimitResult:
+        """
+        Evaluates rate limit and returns detailed telemetry including remaining tokens,
+        reset duration, and retry-after guidance for RFC-compliant HTTP headers.
+        """
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("user_id must be a non-empty string")
+        user_id = user_id.strip()
+
+        tokens = validate_tokens_requested(tokens)
+
+        if tokens > self.capacity:
+            return RateLimitResult(
+                allowed=False,
+                limit=int(self.capacity),
+                remaining=0.0,
+                reset_after=self.capacity / self.refill_rate,
+                retry_after=math.ceil(self.capacity / self.refill_rate)
+            )
+
+        if self.redis and self.check_limit_script:
+            key = f"rate_limit:{user_id}"
+            try:
+                result = self.check_limit_script(
+                    keys=[key],
+                    args=[self.capacity, self.refill_rate, tokens]
                 )
-    
-            if self.redis and self.check_limit_script:
-                key = f"rate_limit:{user_id}"
-                try:
-                    result = self.check_limit_script(
-                        keys=[key],
-                        args=[self.capacity, self.refill_rate, tokens]
-                    )
-                    allowed = bool(result[0] == 1)
-                    remaining = max(0.0, float(result[1]))
-                    reset_after = max(0.0, (self.capacity - remaining) / self.refill_rate)
-                    retry_after = max(1, math.ceil((tokens - remaining) / self.refill_rate)) if not allowed else None
-                    return RateLimitResult(
-                        allowed=allowed,
-                        limit=int(self.capacity),
-                        remaining=remaining,
-                        reset_after=reset_after,
-                        retry_after=retry_after
-                    )
-                except (redis.RedisError, redis.ConnectionError, TimeoutError, OSError) as e:
-                    return self._handle_check_limit_failure(user_id, tokens, e)
-    
-            return self._handle_check_limit_failure(user_id, tokens, ConnectionError("Redis is not connected"))
+                allowed = bool(result[0] == 1)
+                remaining = max(0.0, float(result[1]))
+                reset_after = max(0.0, (self.capacity - remaining) / self.refill_rate)
+                retry_after = max(1, math.ceil((tokens - remaining) / self.refill_rate)) if not allowed else None
+                return RateLimitResult(
+                    allowed=allowed,
+                    limit=int(self.capacity),
+                    remaining=remaining,
+                    reset_after=reset_after,
+                    retry_after=retry_after
+                )
+            except (redis.RedisError, redis.ConnectionError, TimeoutError, OSError) as e:
+                return self._handle_check_limit_failure(user_id, tokens, e)
+
+        return self._handle_check_limit_failure(user_id, tokens, ConnectionError("Redis is not connected"))
     
     def _handle_check_limit_failure(self, user_id: str, tokens: int, error: Exception) -> RateLimitResult:
         if self.failure_mode == FailureMode.FAIL_CLOSED:
