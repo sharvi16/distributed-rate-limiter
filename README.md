@@ -4,7 +4,7 @@ An enterprise-grade, distributed rate limiting and anti-abuse architecture built
 
 ---
 
-## 🌟 Security Architecture & Defenses
+## Security Architecture & Defenses
 
 ```mermaid
 flowchart TD
@@ -37,7 +37,7 @@ flowchart TD
 
 ---
 
-## 🛡️ Defenses Against Modern Attacks
+## Defenses Against Modern Attacks
 
 | Attack Vector | How It Works | How Our System Neutralizes It |
 | :--- | :--- | :--- |
@@ -49,7 +49,7 @@ flowchart TD
 
 ---
 
-## 🚀 Quick Start & Testing
+## Quick Start & Testing
 
 ### 1. Start the API Server
 ```powershell
