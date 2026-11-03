@@ -216,10 +216,20 @@ Run the production multi-worker FastAPI application cluster and secured Redis se
 docker compose up --build
 ```
 
-#### Production Deployment Hardening:
+#### Production Deployment Hardening & Redis Authentication:
 - **Genuine Multi-Stage Build**: `Dockerfile` separates the dependency compiler (`builder` stage) from the minimal runtime image (`runtime` stage), running under a non-root system user (`appuser:appgroup`).
 - **Internal Redis Network**: Redis port 6379 is NOT published publicly to `0.0.0.0` by default. It is accessible exclusively by the `api` container over the internal Docker bridge network (`rate_limiter_net`).
-- **Redis Authentication**: Supports password protection via `REDIS_PASSWORD` and `--requirepass` with authenticated healthchecks.
+- **Redis Password Authentication Integration**:
+  - Automatically applies `REDIS_PASSWORD` across both user-level and IP-level `RateLimiter` instances, the behavioral `AdaptiveSpamDetector`, and the Prometheus `MetricsCollector`.
+  - Supports explicitly configured `REDIS_URL` containing embedded credentials (`redis://:password@host:6379/0` or `redis://user:password@host:6379/0`) without accidentally overriding them.
+  - Rejects contradictory Redis credential configurations (e.g. conflicting passwords between `REDIS_URL` and `REDIS_PASSWORD`) during startup validation.
+  - Masks credentials in logs, string representations, and exception messages (`masked_redis_url`), preventing credential leaks.
+  - Production startup validation rejects missing or weak credentials when password-protected Redis is configured (`REDIS_AUTH_REQUIRED=true` or `REDIS_AUTH_MODE=password`).
+  - First-class support for documented architectural exceptions where application-layer passwords are not used:
+    * `REDIS_AUTH_REQUIRED=false`
+    * `REDIS_AUTH_MODE=mtls` (Mutual TLS client certificate authentication)
+    * `REDIS_AUTH_MODE=iam` (Cloud IAM / instance role authentication)
+    * `REDIS_AUTH_MODE=network_isolated` (VPC private network / service-mesh boundary isolation)
 - **Restricted Trusted Proxies**: Defaults to loopback (`127.0.0.1,::1`). Operators must only specify their actual ingress reverse proxies/load balancers; blanket-trusting RFC1918 private subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) is strictly avoided.
 - **Metrics Endpoint Security**: `PROTECT_METRICS=true` by default, protecting `/metrics` via `x-admin-key`, `x-metrics-key`, `Authorization: Bearer`, or `METRICS_ALLOWED_CIDRS`.
 
@@ -227,14 +237,20 @@ docker compose up --build
 
 ## 🧪 Comprehensive Automated Test Suite
 
-The test suite contains **162 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
+The test suite contains **174 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
 
 ```bash
 pytest tests/ -v
 ```
 
 ### Test Categories:
-- **`tests/security/test_priority3_audit.py`** (18 tests): Prometheus `/metrics` access protection (fail-closed in production, `x-admin-key`, `x-metrics-key`, Bearer token, and `METRICS_ALLOWED_CIDRS` allowlisting, constant-time UTF-8 byte comparison), multi-worker metrics aggregation via Redis atomic counters, process-local telemetry attribution tagged with worker PID, graceful fallback labeling (`scope="process"`) when Redis is unavailable, genuine multi-stage Dockerfile build structure, unexposed internal Redis port in `docker-compose.yml`, and restricted `TRUSTED_PROXIES` configuration.
+- **`tests/security/test_priority3_audit.py`** (30 tests):
+  * **Metrics Access Protection** (10 tests): fail-closed in production, `x-admin-key`, `x-metrics-key`, Bearer token, and `METRICS_ALLOWED_CIDRS` allowlisting, constant-time UTF-8 byte comparison.
+  * **Multi-Worker Metrics** (3 tests): atomic cluster-wide counter aggregation in Redis, process-local PID attribution, graceful fallback labeling (`scope="process"`).
+  * **Deployment Hardening** (5 tests): genuine multi-stage Dockerfile structure, unexposed internal Redis port, restricted `TRUSTED_PROXIES`.
+  * **Redis Authentication Integration** (7 tests): live `CONFIG SET requirepass` acceptance, missing password fails closed, incorrect password fails closed, user and IP limiter authentication, preservation of embedded `REDIS_URL` credentials, immediate rejection of contradictory credentials, safe URL masking in diagnostics and exceptions, and transactional password reconfiguration.
+  * **Redis Startup Validation** (4 tests): production validation rejects missing credentials when auth is required, rejects placeholder or short passwords, and permits documented architectural exceptions (`REDIS_AUTH_REQUIRED=false`, `REDIS_AUTH_MODE=mtls/iam/network_isolated`).
+  * **Multiprocessing Metrics Integration** (1 test): real multiprocessing execution across distinct OS worker processes verifying cluster totals and PID-attributed local counters.
 - **`tests/security/test_priority2_audit.py`** (35 tests): Consistent configuration snapshots in `check_limit()` and fallback paths under `self._lock` (eliminating torn reads), transactional integrity and thread safety of `RateLimiter.configure()` (rejecting partial mutations and verifying Redis arguments/telemetry parity), concurrent `max_local_keys` cache cleanup, server-controlled request costs (elimination of public `tokens` query parameters, ensuring strictly 1.0 token consumed per request and preventing fractional quota evasion), oversized token request handling (raising `ValueError` / returning HTTP 400 Bad Request on `tokens > capacity`, never HTTP 429), complete backward-clock and recovery sequence testing across Redis Lua and local fallback (preventing artificial refills via monotonic `effective_now`), dynamic startup configuration synchronization via `sync_rate_limiter_configuration()`, telemetry precision (`RateLimitResult.limit` float preservation), and clear distinction between burst capacity and sustained refill rate in API responses and headers.
 - **`tests/security/test_admin_protection.py`** (15 tests): Admin key enforcement (fail-closed, missing/empty key denial, invalid key denial, valid key acceptance, UTF-8 byte constant-time comparison to prevent timing attacks and avoid 500 errors on non-ASCII input, single environment variable authoritative source with no stale global fallback, error message neutrality, production startup validation for existence/length/entropy/placeholders).
 - **`tests/security/test_priority1_audit.py`** (43 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy (Shannon entropy & diversity vs length), known placeholder blocklist, strict boolean configuration parsing, startup configuration validation through FastAPI lifespan, production vs development environment isolation, prohibition of unauthenticated headers in production, and identity anti-spoofing.

@@ -151,7 +151,10 @@ class MetricsCollector:
                     "metrics:vpn_hopping_detected_total"
                 ])
                 h_reqs, m_totals = pipe.execute()
-                cluster_reqs = {k: int(v) for k, v in (h_reqs or {}).items()}
+                cluster_reqs = {
+                    (k.decode("utf-8") if isinstance(k, bytes) else str(k)): int(v)
+                    for k, v in (h_reqs or {}).items()
+                }
                 for st in ("allowed", "rate_limited", "jailed", "challenge_required", "error"):
                     if st not in cluster_reqs:
                         cluster_reqs[st] = 0

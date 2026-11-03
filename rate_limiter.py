@@ -36,8 +36,10 @@ Architectural Guarantees & Redis Time Semantics:
 from enum import Enum
 import math
 import os
+import re
 import threading
 import time
+import urllib.parse
 from typing import Any, Dict, Optional, Tuple, Union
 import redis
 
@@ -95,6 +97,40 @@ class _ConfigSnapshot:
     refill_rate: float
     failure_mode: FailureMode
     max_local_keys: int
+
+
+# -----------------------------------------------------------------------------
+# Credential Masking & Safe Diagnostics (Priority 3)
+# -----------------------------------------------------------------------------
+
+def mask_redis_url(url: str) -> str:
+    """
+    Masks embedded credentials in a Redis URL for safe logging, diagnostics, and exceptions.
+    Replaces embedded password with '***', e.g.:
+      'redis://:secret@localhost:6379' -> 'redis://:***@localhost:6379'
+      'redis://admin:secret@host:6379' -> 'redis://admin:***@host:6379'
+    """
+    if not url or not isinstance(url, str):
+        return ""
+
+    def _repl(match):
+        prefix = match.group(1)
+        auth = match.group(2)
+        if ":" in auth:
+            user, _ = auth.split(":", 1)
+            return f"{prefix}{user}:***@"
+        return f"{prefix}***@"
+
+    return re.sub(r"(rediss?://)([^@\s]+)@", _repl, url)
+
+
+def sanitize_redis_error_message(err: Union[str, Exception]) -> str:
+    """
+    Sanitizes an exception or error message string to ensure raw passwords or
+    embedded Redis credentials are never exposed in error responses or logs.
+    """
+    msg = str(err)
+    return mask_redis_url(msg)
 
 
 # -----------------------------------------------------------------------------
@@ -272,7 +308,8 @@ class RateLimiter:
         failure_mode: FailureMode = FailureMode.FAIL_CLOSED,
         enable_fallback: Optional[bool] = None,
         max_local_keys: int = 10000,
-        redis_client: Optional[redis.Redis] = None
+        redis_client: Optional[redis.Redis] = None,
+        redis_password: Optional[str] = None
     ):
         """
         Initialize the Token Bucket Rate Limiter.
@@ -286,12 +323,20 @@ class RateLimiter:
             When cache entries exceed max_local_keys, stale entries (>1h) are purged, followed by
             LRU batch eviction of the oldest 20% entries (at least 1 entry) to amortize sorting overhead.
         :param redis_client: Optional pre-configured Redis client instance (e.g. for testing).
+        :param redis_password: Optional Redis authentication password. If omitted, checks REDIS_PASSWORD env var.
         """
         # Validate initialization invariants (reject booleans, None, strings, NaN, infinity, <= 0)
         self.capacity = validate_positive_number("capacity", capacity)
         self.refill_rate = validate_positive_number("refill_rate", refill_rate)
         self.max_local_keys = validate_positive_int("max_local_keys", max_local_keys)
         self.redis_url = redis_url
+
+        # Redis password configuration: explicitly passed or from environment
+        if redis_password is not None:
+            self.redis_password = redis_password.strip() if redis_password.strip() else None
+        else:
+            env_pwd = os.getenv("REDIS_PASSWORD", "").strip()
+            self.redis_password = env_pwd if env_pwd else None
 
         # Backwards compatibility for legacy `enable_fallback` parameter
         if enable_fallback is not None:
@@ -316,12 +361,26 @@ class RateLimiter:
         else:
             self._register_script()
 
+    @property
+    def masked_redis_url(self) -> str:
+        """Returns the Redis URL with embedded credentials safely masked."""
+        return mask_redis_url(self.redis_url)
+
+    def __repr__(self) -> str:
+        return (
+            f"<RateLimiter url={self.masked_redis_url} "
+            f"capacity={self.capacity} refill_rate={self.refill_rate} "
+            f"failure_mode={self.failure_mode.value}>"
+        )
+
     def configure(
         self,
         capacity: Optional[float] = None,
         refill_rate: Optional[float] = None,
         failure_mode: Optional[Union[FailureMode, str]] = None,
-        max_local_keys: Optional[int] = None
+        max_local_keys: Optional[int] = None,
+        redis_url: Optional[str] = None,
+        redis_password: Optional[str] = None
     ) -> None:
         """
         Dynamically updates rate limiter configuration in place.
@@ -352,6 +411,31 @@ class RateLimiter:
             else:
                 raise ValueError(f"failure_mode must be FailureMode or str, got {type(failure_mode).__name__}")
 
+        new_redis_url = None
+        if redis_url is not None:
+            clean_url = redis_url.strip()
+            if not clean_url:
+                raise ValueError("redis_url cannot be empty")
+            new_redis_url = clean_url
+
+        new_redis_password = None
+        if redis_password is not None:
+            new_redis_password = redis_password.strip() if redis_password.strip() else None
+
+        # Verify credential consistency between URL and password parameter
+        target_url = new_redis_url if new_redis_url is not None else self.redis_url
+        target_pwd = new_redis_password if redis_password is not None else self.redis_password
+        parsed = urllib.parse.urlsplit(target_url)
+        if parsed.password and target_pwd and parsed.password != target_pwd:
+            raise ValueError(
+                "Contradictory Redis credentials: REDIS_PASSWORD does not match the password supplied in REDIS_URL."
+            )
+
+        reconnect_redis = (
+            (new_redis_url is not None and new_redis_url != self.redis_url) or
+            (redis_password is not None and new_redis_password != self.redis_password)
+        )
+
         # All validations passed; atomically mutate instance state under lock
         with self._lock:
             if new_capacity is not None:
@@ -362,18 +446,35 @@ class RateLimiter:
                 self.max_local_keys = new_max_local_keys
             if new_failure_mode is not None:
                 self.failure_mode = new_failure_mode
+            if reconnect_redis:
+                if new_redis_url is not None:
+                    self.redis_url = new_redis_url
+                if redis_password is not None:
+                    self.redis_password = new_redis_password
+                self._init_redis()
 
     def _init_redis(self):
         """Initialize Redis connection and register Lua script."""
         try:
-            self.redis = redis.from_url(
-                self.redis_url,
-                decode_responses=True,
-                socket_connect_timeout=0.5,
-                socket_timeout=0.5
-            )
+            kwargs = {
+                "decode_responses": True,
+                "socket_connect_timeout": 0.5,
+                "socket_timeout": 0.5,
+            }
+            parsed = urllib.parse.urlsplit(self.redis_url)
+            if parsed.password:
+                if self.redis_password and self.redis_password != parsed.password:
+                    raise ValueError(
+                        "Contradictory Redis credentials: REDIS_PASSWORD does not match the password supplied in REDIS_URL."
+                    )
+            elif self.redis_password:
+                kwargs["password"] = self.redis_password
+
+            self.redis = redis.from_url(self.redis_url, **kwargs)
             self._register_script()
-        except Exception as e:
+        except ValueError:
+            raise
+        except Exception:
             self.check_limit_script = None
             if self.failure_mode == FailureMode.FAIL_CLOSED:
                 # Do not suppress if strictly failing closed on startup
@@ -458,7 +559,8 @@ class RateLimiter:
             snapshot = self._get_config_snapshot()
 
         if snapshot.failure_mode == FailureMode.FAIL_CLOSED:
-            raise RedisUnavailableError(f"Rate limiter service unavailable (Redis down: {error})") from error
+            clean_error = sanitize_redis_error_message(error)
+            raise RedisUnavailableError(f"Rate limiter service unavailable (Redis down: {clean_error})") from error
 
         if snapshot.failure_mode == FailureMode.FAIL_OPEN:
             return RateLimitResult(

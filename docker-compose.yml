@@ -36,8 +36,10 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - ENVIRONMENT=${ENVIRONMENT:-production}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_AUTH_REQUIRED=${REDIS_AUTH_REQUIRED:-false}
       - RATE_LIMITER_FAILURE_MODE=fail_closed
       # Restrict trusted proxies strictly to actual reverse proxies / loopback (never blanket RFC1918 CIDRs)
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-127.0.0.1,::1}

@@ -26,13 +26,43 @@ Covers:
 import os
 import re
 import uuid
+from typing import Any, Optional
+import multiprocessing as mp
 import pytest
+import redis
 from fastapi.testclient import TestClient
 
 import main
 from main import app, limiter, detector
 from metrics import MetricsCollector
-from auth import validate_auth_configuration
+from rate_limiter import RateLimiter, FailureMode, RedisUnavailableError, mask_redis_url
+from auth import (
+    validate_auth_configuration,
+    validate_redis_configuration,
+    get_redis_auth_mode,
+    is_redis_auth_required
+)
+
+
+def _mp_metrics_worker_task(redis_url: str, redis_password: Optional[str], status_label: str, count: int, result_queue: Any):
+    """
+    Top-level helper function for multiprocessing tests (Windows spawn-compatible).
+    Simulates a separate OS worker process initializing its own Redis-backed MetricsCollector
+    and incrementing request counters.
+    """
+    client = None
+    if redis_url:
+        client = redis.from_url(redis_url, password=redis_password, decode_responses=True)
+    collector = MetricsCollector(redis_client=client)
+    for _ in range(count):
+        collector.inc_request(status_label)
+    scrape = collector.generate_prometheus_output()
+    result_queue.put({
+        "pid": os.getpid(),
+        "status_label": status_label,
+        "count": count,
+        "scrape": scrape
+    })
 
 
 @pytest.fixture
@@ -371,3 +401,303 @@ class TestDeploymentAndConfigurationHardening:
         assert "10.0.0.0/8" not in content, "Blanket CIDR 10.0.0.0/8 must not be in TRUSTED_PROXIES"
         assert "172.16.0.0/12" not in content, "Blanket CIDR 172.16.0.0/12 must not be in TRUSTED_PROXIES"
         assert "192.168.0.0/16" not in content, "Blanket CIDR 192.168.0.0/16 must not be in TRUSTED_PROXIES"
+
+
+# =============================================================================
+# 4. Redis Authentication & Password Handling Integration
+# =============================================================================
+
+class TestRedisAuthenticationIntegration:
+    """
+    Real Redis integration tests using live CONFIG SET requirepass.
+    Verifies that password-authenticated Redis connections work seamlessly,
+    missing or incorrect credentials fail closed, embedded credentials are preserved,
+    and secrets never leak in logs, string representations, or exceptions.
+    """
+
+    @pytest.fixture
+    def live_protected_redis(self):
+        """Sets up live local Redis with requirepass and guarantees clean reset in finally."""
+        secret = "test_redis_prod_secret_token_12345"
+        r = redis.Redis(host="localhost", port=6379, socket_timeout=1.0)
+        try:
+            r.ping()
+        except Exception:
+            pytest.skip("Local Redis server not available on localhost:6379 for live auth test")
+
+        r.config_set("requirepass", secret)
+        try:
+            yield secret
+        finally:
+            try:
+                r_authed = redis.Redis(host="localhost", port=6379, password=secret, socket_timeout=1.0)
+                r_authed.config_set("requirepass", "")
+            except Exception:
+                pass
+
+    def test_authenticated_redis_connection_accepted(self, live_protected_redis):
+        """RateLimiter connects and executes Lua script successfully with correct password."""
+        secret = live_protected_redis
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password=secret,
+            capacity=10,
+            refill_rate=1.0,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        assert limiter.is_redis_active() is True
+        res = limiter.check_limit(f"test_auth_user_{uuid.uuid4().hex[:8]}")
+        assert res.allowed is True
+        assert res.limit == 10.0
+
+    def test_missing_redis_password_fails_closed(self, live_protected_redis):
+        """RateLimiter with missing password fails closed with RedisUnavailableError (no secret leaked)."""
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password=None,
+            capacity=10,
+            refill_rate=1.0,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        with pytest.raises(RedisUnavailableError) as exc_info:
+            limiter.check_limit(f"test_user_no_pwd_{uuid.uuid4().hex[:8]}")
+
+        err_msg = str(exc_info.value)
+        assert "Authentication" in err_msg or "NOAUTH" in err_msg or "unavailable" in err_msg
+        assert live_protected_redis not in err_msg
+
+    def test_incorrect_redis_password_fails_closed(self, live_protected_redis):
+        """RateLimiter with wrong password fails closed with RedisUnavailableError without leaking wrong secret."""
+        wrong_pwd = "wrong_password_attempt_9999"
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password=wrong_pwd,
+            capacity=10,
+            refill_rate=1.0,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        with pytest.raises(RedisUnavailableError) as exc_info:
+            limiter.check_limit(f"test_user_wrong_pwd_{uuid.uuid4().hex[:8]}")
+
+        err_msg = str(exc_info.value)
+        assert "unavailable" in err_msg or "WRONGPASS" in err_msg or "Authentication" in err_msg
+        assert wrong_pwd not in err_msg
+        assert live_protected_redis not in err_msg
+
+    def test_both_user_and_ip_limiters_authenticate(self, live_protected_redis, monkeypatch):
+        """Both user limiter and IP limiter authenticate and function properly."""
+        secret = live_protected_redis
+        monkeypatch.setenv("REDIS_PASSWORD", secret)
+        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+
+        user_limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password=secret,
+            capacity=10,
+            refill_rate=1.0,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        ip_limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password=secret,
+            capacity=30,
+            refill_rate=2.0,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+
+        assert user_limiter.is_redis_active() is True
+        assert ip_limiter.is_redis_active() is True
+
+        user_res = user_limiter.check_limit(f"user_{uuid.uuid4().hex[:8]}")
+        ip_res = ip_limiter.check_limit(f"198.51.100.{uuid.uuid4().int % 250}")
+        assert user_res.allowed is True
+        assert ip_res.allowed is True
+
+    def test_embedded_url_credentials_accepted_and_not_overwritten(self, live_protected_redis):
+        """Credentials embedded in REDIS_URL are accepted, not overwritten, and masked in diagnostics."""
+        secret = live_protected_redis
+        url_with_auth = f"redis://:{secret}@localhost:6379/0"
+
+        limiter = RateLimiter(
+            redis_url=url_with_auth,
+            capacity=10,
+            refill_rate=1.0,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        assert limiter.is_redis_active() is True
+        res = limiter.check_limit(f"test_url_auth_{uuid.uuid4().hex[:8]}")
+        assert res.allowed is True
+
+        # Diagnostic masking
+        assert limiter.masked_redis_url == "redis://:***@localhost:6379/0"
+        assert secret not in str(limiter)
+        assert secret not in repr(limiter)
+        assert secret not in limiter.masked_redis_url
+
+    def test_contradictory_credentials_rejected_immediately(self):
+        """Contradictory password in REDIS_URL vs REDIS_PASSWORD raises ValueError failing fast."""
+        with pytest.raises(ValueError, match="Contradictory Redis credentials"):
+            RateLimiter(
+                redis_url="redis://:url_password@localhost:6379/0",
+                redis_password="different_password_in_env",
+                failure_mode=FailureMode.FAIL_CLOSED
+            )
+
+    def test_configure_updates_redis_password_transactionally(self, live_protected_redis):
+        """RateLimiter.configure() safely updates Redis password and re-connects."""
+        secret = live_protected_redis
+        # Start with wrong password
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password="incorrect_initial_pwd",
+            capacity=10,
+            refill_rate=1.0,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        assert limiter.is_redis_active() is False
+
+        # Reconfigure with correct password
+        limiter.configure(redis_password=secret)
+        assert limiter.is_redis_active() is True
+        assert limiter.check_limit(f"reconfigured_user_{uuid.uuid4().hex[:8]}").allowed is True
+
+
+# =============================================================================
+# 5. Redis Startup Validation
+# =============================================================================
+
+class TestRedisStartupValidation:
+    """Validates startup-time configuration enforcement for Redis authentication."""
+
+    def test_production_fails_when_redis_auth_required_but_missing(self, monkeypatch):
+        """Production startup fails if REDIS_AUTH_REQUIRED=true but no credentials are provided."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
+        monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
+        monkeypatch.setenv("PROTECT_METRICS", "true")
+        monkeypatch.setenv("REDIS_AUTH_REQUIRED", "true")
+        monkeypatch.delenv("REDIS_PASSWORD", raising=False)
+        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+
+        with pytest.raises(RuntimeError, match="Redis authentication is required in production"):
+            validate_auth_configuration()
+
+    def test_production_fails_when_redis_password_is_placeholder(self, monkeypatch):
+        """Production startup fails if Redis password is a known insecure placeholder."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
+        monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
+        monkeypatch.setenv("PROTECT_METRICS", "true")
+        monkeypatch.setenv("REDIS_PASSWORD", "password")
+
+        with pytest.raises(ValueError, match="known insecure placeholder"):
+            validate_auth_configuration()
+
+    def test_production_fails_when_redis_password_too_short(self, monkeypatch):
+        """Production startup fails if Redis password is too short (< 16 chars)."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
+        monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
+        monkeypatch.setenv("PROTECT_METRICS", "true")
+        monkeypatch.setenv("REDIS_PASSWORD", "short_pwd")
+
+        with pytest.raises(ValueError, match="insufficient length"):
+            validate_auth_configuration()
+
+    def test_production_succeeds_with_architectural_exception(self, monkeypatch):
+        """Production startup succeeds without password if an architectural exception is documented."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
+        monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
+        monkeypatch.setenv("PROTECT_METRICS", "true")
+
+        # Architectural exception 1: REDIS_AUTH_MODE=mtls
+        monkeypatch.setenv("REDIS_AUTH_MODE", "mtls")
+        validate_auth_configuration()
+
+        # Architectural exception 2: REDIS_AUTH_MODE=iam
+        monkeypatch.setenv("REDIS_AUTH_MODE", "iam")
+        validate_auth_configuration()
+
+        # Architectural exception 3: REDIS_AUTH_MODE=network_isolated
+        monkeypatch.setenv("REDIS_AUTH_MODE", "network_isolated")
+        validate_auth_configuration()
+
+        # Architectural exception 4: REDIS_AUTH_REQUIRED=false
+        monkeypatch.delenv("REDIS_AUTH_MODE", raising=False)
+        monkeypatch.setenv("REDIS_AUTH_REQUIRED", "false")
+        validate_auth_configuration()
+
+
+# =============================================================================
+# 6. Multi-Worker Real Multiprocessing Metrics Integration
+# =============================================================================
+
+class TestMultiprocessingMetricsIntegration:
+    """Verifies multi-worker metrics aggregation using distinct OS processes via multiprocessing."""
+
+    def test_distinct_os_processes_aggregate_cluster_wide_counters(self):
+        """Spawns 2 real OS worker processes and verifies cluster-wide totals and PID attribution."""
+        r = redis.Redis(host="localhost", port=6379, socket_timeout=1.0)
+        try:
+            r.ping()
+        except Exception:
+            pytest.skip("Local Redis server not available on localhost:6379 for multiprocessing test")
+
+        # Reset Redis test metrics keys
+        r.delete("metrics:requests_total")
+
+        result_queue = mp.Queue()
+        redis_url = "redis://localhost:6379"
+
+        # Worker 1: generates 12 'allowed' requests
+        p1 = mp.Process(
+            target=_mp_metrics_worker_task,
+            args=(redis_url, None, "allowed", 12, result_queue)
+        )
+        # Worker 2: generates 7 'rate_limited' requests
+        p2 = mp.Process(
+            target=_mp_metrics_worker_task,
+            args=(redis_url, None, "rate_limited", 7, result_queue)
+        )
+
+        p1.start()
+        p2.start()
+
+        p1.join(timeout=10.0)
+        p2.join(timeout=10.0)
+
+        assert p1.exitcode == 0, f"Worker process 1 failed with exit code {p1.exitcode}"
+        assert p2.exitcode == 0, f"Worker process 2 failed with exit code {p2.exitcode}"
+
+        # Collect worker results
+        results = [result_queue.get(timeout=2.0), result_queue.get(timeout=2.0)]
+        pids = {res["pid"] for res in results}
+
+        # Verify two distinct OS PIDs executed
+        assert len(pids) == 2, f"Expected 2 distinct OS worker PIDs, got {pids}"
+        assert p1.pid in pids
+        assert p2.pid in pids
+
+        # Scrape metrics from parent process
+        parent_collector = MetricsCollector(redis_client=r)
+        parent_scrape = parent_collector.generate_prometheus_output()
+
+        # Cluster-wide totals must equal sum of worker contributions
+        assert 'ratelimit_requests_total{status="allowed",scope="cluster"} 12' in parent_scrape
+        assert 'ratelimit_requests_total{status="rate_limited",scope="cluster"} 7' in parent_scrape
+
+        # Each worker's individual scrape attributed to its own PID
+        for res in results:
+            w_pid = res["pid"]
+            w_scrape = res["scrape"]
+            assert f'pid="{w_pid}"' in w_scrape
+            assert "ratelimit_process_requests_total" in w_scrape

@@ -51,6 +51,7 @@ app = FastAPI(
 # Service Initializations
 # -----------------------------------------------------------------------------
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_password = os.getenv("REDIS_PASSWORD", "").strip() or None
 trusted_proxies_cfg = os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1")
 TRUSTED_PROXIES = parse_trusted_proxies(trusted_proxies_cfg)
 failure_mode_str = os.getenv("RATE_LIMITER_FAILURE_MODE", FailureMode.FAIL_CLOSED.value)
@@ -68,6 +69,7 @@ ip_refill_rate = parse_env_positive_float("IP_RATE_LIMITER_REFILL_RATE", default
 # Initialize Token Bucket Rate Limiter
 limiter = RateLimiter(
     redis_url=redis_url,
+    redis_password=redis_password,
     capacity=user_capacity,
     refill_rate=user_refill_rate,
     failure_mode=configured_failure_mode
@@ -76,6 +78,7 @@ limiter = RateLimiter(
 # Initialize Outer IP Guardrail Rate Limiter
 ip_limiter = RateLimiter(
     redis_url=redis_url,
+    redis_password=redis_password,
     capacity=ip_capacity,
     refill_rate=ip_refill_rate,
     failure_mode=configured_failure_mode
@@ -95,8 +98,23 @@ def sync_rate_limiter_configuration() -> None:
     Called during application lifespan startup to guarantee runtime consistency.
     """
     user_cap, user_refill, ip_cap, ip_refill, f_mode = validate_rate_limiter_configuration()
-    limiter.configure(capacity=user_cap, refill_rate=user_refill, failure_mode=f_mode)
-    ip_limiter.configure(capacity=ip_cap, refill_rate=ip_refill, failure_mode=f_mode)
+    cur_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    cur_pwd = os.getenv("REDIS_PASSWORD", "").strip() or None
+    limiter.configure(
+        capacity=user_cap,
+        refill_rate=user_refill,
+        failure_mode=f_mode,
+        redis_url=cur_url,
+        redis_password=cur_pwd
+    )
+    ip_limiter.configure(
+        capacity=ip_cap,
+        refill_rate=ip_refill,
+        failure_mode=f_mode,
+        redis_url=cur_url,
+        redis_password=cur_pwd
+    )
+    detector.redis = limiter.redis
     metrics_collector.set_redis(limiter.redis)
 
 

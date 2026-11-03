@@ -21,6 +21,7 @@ import hmac
 import hashlib
 import time
 import secrets
+import urllib.parse
 from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
@@ -289,6 +290,9 @@ def validate_auth_configuration() -> None:
     # 6. Validate metrics endpoint security configuration
     validate_metrics_configuration()
 
+    # 7. Validate Redis security configuration
+    validate_redis_configuration()
+
 
 def validate_metrics_configuration() -> None:
     """
@@ -332,6 +336,112 @@ def validate_metrics_configuration() -> None:
                 raise ValueError(
                     f"CRITICAL SECURITY CONFIGURATION ERROR: METRICS_API_KEY has insufficient cryptographic entropy "
                     f"(entropy: {entropy:.2f} bits/symbol, unique chars: {unique_chars})."
+                )
+
+
+def get_redis_auth_mode() -> str:
+    """
+    Returns the configured Redis authentication mode.
+    Supported modes:
+      - 'password': Password-based authentication via REDIS_PASSWORD or REDIS_URL credentials (default when credentials are configured).
+      - 'mtls': Mutual TLS / client certificate authentication (architectural exception).
+      - 'iam': Cloud IAM / instance metadata authentication (architectural exception).
+      - 'network_isolated': Private network / VPC / service-mesh isolated without application-layer password (architectural exception).
+      - 'none': Explicit unauthenticated Redis (prohibited in production unless REDIS_AUTH_REQUIRED=false).
+    """
+    mode = os.getenv("REDIS_AUTH_MODE", "").strip().lower()
+    if mode:
+        return mode
+    if os.getenv("REDIS_PASSWORD", "").strip():
+        return "password"
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    parsed = urllib.parse.urlsplit(redis_url)
+    if parsed.password:
+        return "password"
+    return "none"
+
+
+def is_redis_auth_required() -> bool:
+    """
+    Returns True if Redis authentication is required for this deployment.
+    Accepts REDIS_AUTH_REQUIRED or REQUIRE_REDIS_AUTH environment variables.
+    """
+    val = os.getenv("REDIS_AUTH_REQUIRED")
+    if val is None:
+        val = os.getenv("REQUIRE_REDIS_AUTH")
+    if val is not None and val.strip() != "":
+        var_name = "REDIS_AUTH_REQUIRED" if os.getenv("REDIS_AUTH_REQUIRED") is not None else "REQUIRE_REDIS_AUTH"
+        return parse_bool_env(var_name, default=False)
+    # If auth mode is explicitly configured as 'password', auth is required
+    mode = os.getenv("REDIS_AUTH_MODE", "").strip().lower()
+    if mode == "password":
+        return True
+    return False
+
+
+def validate_redis_configuration() -> None:
+    """
+    Validates Redis authentication and security configuration during application startup.
+    
+    Security Rules:
+      1. Contradiction Detection: Rejects contradictory credentials (REDIS_PASSWORD != password in REDIS_URL).
+      2. Insecure Secrets / Placeholders: Rejects known example or weak passwords.
+      3. Production Validation:
+         - When production uses password-protected Redis (REDIS_AUTH_REQUIRED=true or REDIS_AUTH_MODE=password):
+           rejects missing Redis credentials.
+         - Minimum length check on configured passwords in production (at least 16 chars).
+         - Respects architectural exceptions:
+           * REDIS_AUTH_REQUIRED=false or REQUIRE_REDIS_AUTH=false
+           * REDIS_AUTH_MODE in ('mtls', 'iam', 'network_isolated')
+      4. Secrets are NEVER logged or printed in exceptions/errors.
+    """
+    is_prod = is_production_env()
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    parsed = urllib.parse.urlsplit(redis_url)
+    url_password = parsed.password
+    env_password = os.getenv("REDIS_PASSWORD", "").strip() or None
+
+    # 1. Contradiction check: URL password vs REDIS_PASSWORD
+    if url_password and env_password:
+        if url_password != env_password:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: Contradictory Redis credentials detected. "
+                "The password provided in REDIS_URL does not match REDIS_PASSWORD."
+            )
+
+    effective_password = env_password or url_password
+    auth_mode = get_redis_auth_mode()
+    redis_auth_required = is_redis_auth_required()
+
+    # 2. Known placeholder & weak password rejection
+    KNOWN_REDIS_PLACEHOLDERS = KNOWN_INSECURE_SECRETS.union({
+        "password", "redis", "admin", "changeme", "root", "secret", "default", "redispassword"
+    })
+
+    if effective_password:
+        if effective_password.lower() in KNOWN_REDIS_PLACEHOLDERS:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: Redis password is configured with a known insecure placeholder or example value."
+            )
+        if is_prod and len(effective_password) < 16:
+            raise ValueError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: Redis password has insufficient length "
+                f"({len(effective_password)} characters). Minimum recommended length in production is 16 characters."
+            )
+
+    # 3. Production enforcement
+    if is_prod:
+        is_architectural_exception = auth_mode in ("mtls", "iam", "network_isolated")
+        req_auth_env = os.getenv("REDIS_AUTH_REQUIRED") or os.getenv("REQUIRE_REDIS_AUTH")
+        if req_auth_env is not None and not redis_auth_required:
+            is_architectural_exception = True
+
+        if not is_architectural_exception:
+            if redis_auth_required and not effective_password:
+                raise RuntimeError(
+                    "CRITICAL SECURITY CONFIGURATION ERROR: Redis authentication is required in production, "
+                    "but no Redis credentials were provided. Supply REDIS_PASSWORD, embed credentials in REDIS_URL, "
+                    "or configure an architectural exception (REDIS_AUTH_REQUIRED=false or REDIS_AUTH_MODE=mtls/iam/network_isolated)."
                 )
 
 
