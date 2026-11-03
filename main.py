@@ -25,12 +25,12 @@ from metrics import metrics_collector
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI lifespan handler executing startup configuration validation.
+    FastAPI lifespan handler executing startup configuration validation and synchronization.
     Ensures authentication, encryption keys, admin secrets, and rate limiter
-    environment variables are verified before accepting incoming HTTP requests.
+    environment variables are verified and synchronized before accepting incoming HTTP requests.
     """
     validate_auth_configuration()
-    validate_rate_limiter_configuration()
+    sync_rate_limiter_configuration()
     yield
 
 
@@ -77,6 +77,29 @@ ip_limiter = RateLimiter(
 
 # Initialize Self-Learning Spam & Abuse Detector
 detector = AdaptiveSpamDetector(redis_client=limiter.redis)
+
+
+def sync_rate_limiter_configuration() -> None:
+    """
+    Synchronizes instantiated RateLimiter objects with the latest validated
+    environment variable configuration.
+    Called during application lifespan startup to guarantee runtime consistency.
+    """
+    user_cap, user_refill, ip_cap, ip_refill, f_mode = validate_rate_limiter_configuration()
+    limiter.configure(capacity=user_cap, refill_rate=user_refill, failure_mode=f_mode)
+    ip_limiter.configure(capacity=ip_cap, refill_rate=ip_refill, failure_mode=f_mode)
+
+
+def format_token_limit(val: float) -> str:
+    """Formats rate limit capacity preserving fractional precision when non-integer."""
+    if val.is_integer():
+        return str(int(val))
+    return str(val)
+
+
+def format_token_remaining(val: float) -> str:
+    """Formats remaining tokens as integer string, clamped to >= 0."""
+    return str(max(0, int(val)))
 
 
 def verify_admin_key(x_admin_key: Optional[str] = Header(None, alias="x-admin-key")) -> bool:
@@ -151,11 +174,15 @@ def limited_resource(
     request: Request,
     response: Response,
     principal: AuthenticatedPrincipal = Depends(get_authenticated_principal),
-    user_agent: Optional[str] = Header("", alias="user-agent"),
-    tokens: Optional[float] = Query(1.0, description="Tokens requested")
+    user_agent: Optional[str] = Header("", alias="user-agent")
 ):
     """
     Adaptive Rate Limited & Abuse Protected Endpoint.
+    
+    Server-Controlled Cost Semantics (Priority 2):
+      - Ordinary requests consume strictly 1.0 token (server-controlled cost).
+      - Clients cannot specify arbitrary token weights or reduce consumption via query parameters.
+      - Burst capacity is explicitly distinguished from sustained refill rate in telemetry and errors.
     
     Tiers of evaluation:
       1. Penalty Box Check: If user was flagged as spammer and jailed, immediately block (429).
@@ -163,16 +190,10 @@ def limited_resource(
       3. Self-Learning ML Risk Scoring: Classifies as 'human', 'suspicious', or 'spammer'.
          - 'spammer': Immediately jailed in Penalty Box.
          - 'suspicious': Serves challenge (403). Solving challenge trains model that user is human.
-         - 'human': Evaluated by Token Bucket (10 requests/min).
+         - 'human': Evaluated by Token Bucket.
     """
-    # Validate requested tokens parameter (Priority 2)
-    try:
-        tokens_requested = validate_tokens_requested(tokens if tokens is not None else 1.0)
-    except (ValueError, TypeError) as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid tokens parameter: {e}"
-        )
+    # Server-controlled request cost: exactly 1 token per request
+    REQUEST_COST = 1.0
 
     # Rate limit identity is derived strictly from the authenticated principal
     user_id = principal.user_id
@@ -247,7 +268,12 @@ def limited_resource(
     # Caps total traffic from the physical network, regardless of user accounts.
     # -------------------------------------------------------------------------
     try:
-        ip_result = ip_limiter.check_limit(f"ip:{client_ip}", tokens=1)
+        ip_result = ip_limiter.check_limit(f"ip:{client_ip}", tokens=1.0)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid rate limit request: {e}"
+        )
     except (redis.RedisError, RedisUnavailableError):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -256,18 +282,22 @@ def limited_resource(
 
     if not ip_result.allowed:
         metrics_collector.inc_request("rate_limited")
+        refill_per_min = ip_limiter.refill_rate * 60.0
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
-                "message": f"Physical IP rate limit exceeded ({int(ip_limiter.capacity)} requests per minute across all accounts). Try again later.",
+                "message": (
+                    f"Physical IP rate limit exceeded (burst capacity: {format_token_limit(ip_limiter.capacity)} tokens, "
+                    f"sustained refill rate: {refill_per_min:.1f} requests/minute across all accounts). Try again later."
+                ),
                 "client_ip": client_ip
             },
             headers={
-                "X-RateLimit-Limit": str(ip_result.limit),
-                "X-RateLimit-Remaining": str(max(0, int(ip_result.remaining))),
+                "X-RateLimit-Limit": format_token_limit(ip_result.limit),
+                "X-RateLimit-Remaining": format_token_remaining(ip_result.remaining),
                 "X-RateLimit-Reset": str(math.ceil(ip_result.reset_after)),
-                "RateLimit-Limit": str(ip_result.limit),
-                "RateLimit-Remaining": str(max(0, int(ip_result.remaining))),
+                "RateLimit-Limit": format_token_limit(ip_result.limit),
+                "RateLimit-Remaining": format_token_remaining(ip_result.remaining),
                 "RateLimit-Reset": str(math.ceil(ip_result.reset_after)),
                 "Retry-After": str(ip_result.retry_after or 1)
             }
@@ -277,7 +307,12 @@ def limited_resource(
     # Tier 3: User Token Bucket Quota
     # -------------------------------------------------------------------------
     try:
-        rate_result = limiter.check_limit(user_id, tokens=tokens_requested)
+        rate_result = limiter.check_limit(user_id, tokens=REQUEST_COST)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid rate limit request: {e}"
+        )
     except (redis.RedisError, RedisUnavailableError):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -286,29 +321,33 @@ def limited_resource(
 
     if not rate_result.allowed:
         metrics_collector.inc_request("rate_limited")
+        refill_per_min = limiter.refill_rate * 60.0
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
-                "message": f"Rate limit exceeded ({int(limiter.capacity)} requests per minute). Quota exhausted. Try again later.",
+                "message": (
+                    f"Rate limit exceeded (burst capacity: {format_token_limit(limiter.capacity)} tokens, "
+                    f"sustained refill rate: {refill_per_min:.1f} requests/minute). Quota exhausted. Try again later."
+                ),
                 "user_id": user_id
             },
             headers={
-                "X-RateLimit-Limit": str(rate_result.limit),
-                "X-RateLimit-Remaining": str(max(0, int(rate_result.remaining))),
+                "X-RateLimit-Limit": format_token_limit(rate_result.limit),
+                "X-RateLimit-Remaining": format_token_remaining(rate_result.remaining),
                 "X-RateLimit-Reset": str(math.ceil(rate_result.reset_after)),
-                "RateLimit-Limit": str(rate_result.limit),
-                "RateLimit-Remaining": str(max(0, int(rate_result.remaining))),
+                "RateLimit-Limit": format_token_limit(rate_result.limit),
+                "RateLimit-Remaining": format_token_remaining(rate_result.remaining),
                 "RateLimit-Reset": str(math.ceil(rate_result.reset_after)),
                 "Retry-After": str(rate_result.retry_after or 1)
             }
         )
 
     # Attach standard RFC and IETF rate limit headers to successful evaluation
-    response.headers["X-RateLimit-Limit"] = str(rate_result.limit)
-    response.headers["X-RateLimit-Remaining"] = str(max(0, int(rate_result.remaining)))
+    response.headers["X-RateLimit-Limit"] = format_token_limit(rate_result.limit)
+    response.headers["X-RateLimit-Remaining"] = format_token_remaining(rate_result.remaining)
     response.headers["X-RateLimit-Reset"] = str(math.ceil(rate_result.reset_after))
-    response.headers["RateLimit-Limit"] = str(rate_result.limit)
-    response.headers["RateLimit-Remaining"] = str(max(0, int(rate_result.remaining)))
+    response.headers["RateLimit-Limit"] = format_token_limit(rate_result.limit)
+    response.headers["RateLimit-Remaining"] = format_token_remaining(rate_result.remaining)
     response.headers["RateLimit-Reset"] = str(math.ceil(rate_result.reset_after))
 
     # If the user already has an unsolved challenge and continues hammering -> Auto-jail!

@@ -65,7 +65,7 @@ class RateLimitResult:
     Attributes:
         allowed (bool): True if the requested tokens were permitted and consumed;
             False if remaining quota was insufficient.
-        limit (int): Maximum burst capacity of the token bucket.
+        limit (float): Maximum burst capacity of the token bucket (never truncated).
         remaining (float): Available tokens remaining in the bucket immediately
             following evaluation.
         reset_after (float): Relative duration in seconds until the bucket is completely
@@ -76,7 +76,7 @@ class RateLimitResult:
             None when allowed=True.
     """
     allowed: bool
-    limit: int
+    limit: float
     remaining: float
     reset_after: float
     retry_after: Optional[int] = None
@@ -161,15 +161,35 @@ def parse_env_positive_float(var_name: str, default: float) -> float:
     return val
 
 
-def validate_rate_limiter_configuration():
+def load_rate_limiter_config() -> Tuple[float, float, float, float, FailureMode]:
+    """
+    Reads and strictly validates rate limiter configuration from environment variables.
+    Fails fast if any value is invalid, NaN, infinity, boolean, or non-positive.
+    Returns: (user_capacity, user_refill_rate, ip_capacity, ip_refill_rate, failure_mode)
+    """
+    user_cap = parse_env_positive_float("RATE_LIMITER_CAPACITY", default=10.0)
+    user_refill = parse_env_positive_float("RATE_LIMITER_REFILL_RATE", default=10.0 / 60.0)
+    ip_cap = parse_env_positive_float("IP_RATE_LIMITER_CAPACITY", default=30.0)
+    ip_refill = parse_env_positive_float("IP_RATE_LIMITER_REFILL_RATE", default=30.0 / 60.0)
+
+    failure_mode_str = os.getenv("RATE_LIMITER_FAILURE_MODE", FailureMode.FAIL_CLOSED.value).lower().strip()
+    try:
+        failure_mode = FailureMode(failure_mode_str)
+    except ValueError:
+        raise ValueError(
+            f"Invalid RATE_LIMITER_FAILURE_MODE: {failure_mode_str!r}. "
+            "Must be one of: fail_closed, fail_open, local_fallback"
+        )
+
+    return user_cap, user_refill, ip_cap, ip_refill, failure_mode
+
+
+def validate_rate_limiter_configuration() -> Tuple[float, float, float, float, FailureMode]:
     """
     Validates rate limiter environment variables at application startup.
     Fails fast if RATE_LIMITER_CAPACITY or RATE_LIMITER_REFILL_RATE are invalid.
     """
-    parse_env_positive_float("RATE_LIMITER_CAPACITY", default=10.0)
-    parse_env_positive_float("RATE_LIMITER_REFILL_RATE", default=10.0 / 60.0)
-    parse_env_positive_float("IP_RATE_LIMITER_CAPACITY", default=30.0)
-    parse_env_positive_float("IP_RATE_LIMITER_REFILL_RATE", default=30.0 / 60.0)
+    return load_rate_limiter_config()
 
 
 class RateLimiter:
@@ -190,7 +210,7 @@ class RateLimiter:
 
     -- 1. Obtain server wall-clock time from Redis (gettimeofday, CLOCK_REALTIME).
     -- Note: Server wall-clock time eliminates client drift across distributed application nodes.
-    -- Any backward clock steps (e.g. from NTP adjustments) are strictly clamped below via math.max(0, ...).
+    -- Non-monotonic steps are safeguarded below via monotonic effective_now = math.max(now, last_updated).
     local time_val = redis.call('TIME')
     local now = tonumber(time_val[1]) + (tonumber(time_val[2]) / 1000000)
 
@@ -205,8 +225,9 @@ class RateLimiter:
         last_updated = now
     end
 
-    -- 4. Calculate continuous refill based on elapsed Redis server seconds
-    local delta = math.max(0, now - last_updated)
+    -- 4. Monotonic effective timestamp: effective_now never decreases
+    local effective_now = math.max(now, last_updated)
+    local delta = effective_now - last_updated
     local filled_tokens = math.min(capacity, tokens + (delta * refill_rate))
 
     local allowed = 0
@@ -215,9 +236,9 @@ class RateLimiter:
         allowed = 1
     end
 
-    -- 5. Atomic state update & dynamic TTL (at least 300s or 2x full refill duration)
+    -- 5. Atomic state update & dynamic TTL (persist effective_now, never a regressed timestamp)
     local ttl = math.max(300, math.ceil((capacity / refill_rate) * 2))
-    redis.call('HMSET', key, 'tokens', filled_tokens, 'last_updated', now)
+    redis.call('HMSET', key, 'tokens', filled_tokens, 'last_updated', effective_now)
     redis.call('EXPIRE', key, ttl)
 
     return {allowed, tostring(filled_tokens)}
@@ -273,6 +294,28 @@ class RateLimiter:
         else:
             self._register_script()
 
+    def configure(
+        self,
+        capacity: Optional[float] = None,
+        refill_rate: Optional[float] = None,
+        failure_mode: Optional[Union[FailureMode, str]] = None,
+        max_local_keys: Optional[int] = None
+    ) -> None:
+        """
+        Dynamically updates rate limiter configuration in place.
+        Validates arguments prior to mutating instance state.
+        """
+        if capacity is not None:
+            self.capacity = validate_positive_number("capacity", capacity)
+        if refill_rate is not None:
+            self.refill_rate = validate_positive_number("refill_rate", refill_rate)
+        if max_local_keys is not None:
+            self.max_local_keys = validate_positive_int("max_local_keys", max_local_keys)
+        if failure_mode is not None:
+            if isinstance(failure_mode, str):
+                failure_mode = FailureMode(failure_mode.lower())
+            self.failure_mode = failure_mode
+
     def _init_redis(self):
         """Initialize Redis connection and register Lua script."""
         try:
@@ -309,12 +352,8 @@ class RateLimiter:
         tokens = validate_tokens_requested(tokens)
 
         if tokens > self.capacity:
-            return RateLimitResult(
-                allowed=False,
-                limit=int(self.capacity),
-                remaining=0.0,
-                reset_after=self.capacity / self.refill_rate,
-                retry_after=math.ceil(self.capacity / self.refill_rate)
+            raise ValueError(
+                f"tokens requested ({tokens}) exceeds maximum bucket capacity ({self.capacity})"
             )
 
         if self.redis and self.check_limit_script:
@@ -330,7 +369,7 @@ class RateLimiter:
                 retry_after = max(1, math.ceil((tokens - remaining) / self.refill_rate)) if not allowed else None
                 return RateLimitResult(
                     allowed=allowed,
-                    limit=int(self.capacity),
+                    limit=self.capacity,
                     remaining=remaining,
                     reset_after=reset_after,
                     retry_after=retry_after
@@ -340,14 +379,14 @@ class RateLimiter:
 
         return self._handle_check_limit_failure(user_id, tokens, ConnectionError("Redis is not connected"))
     
-    def _handle_check_limit_failure(self, user_id: str, tokens: int, error: Exception) -> RateLimitResult:
+    def _handle_check_limit_failure(self, user_id: str, tokens: Union[int, float], error: Exception) -> RateLimitResult:
         if self.failure_mode == FailureMode.FAIL_CLOSED:
             raise RedisUnavailableError(f"Rate limiter service unavailable (Redis down: {error})") from error
 
         if self.failure_mode == FailureMode.FAIL_OPEN:
             return RateLimitResult(
                 allowed=True,
-                limit=int(self.capacity),
+                limit=self.capacity,
                 remaining=self.capacity,
                 reset_after=0.0,
                 retry_after=None
@@ -367,34 +406,40 @@ class RateLimiter:
                         del self._local_buckets[k]
 
             current_tokens, last_updated = self._local_buckets.get(user_id, (self.capacity, now))
-            delta = max(0.0, now - last_updated)
+            effective_now = max(now, last_updated)
+            delta = effective_now - last_updated
             refilled = min(self.capacity, current_tokens + (delta * self.refill_rate))
 
             if refilled >= tokens:
                 remaining = refilled - tokens
-                self._local_buckets[user_id] = (remaining, now)
+                self._local_buckets[user_id] = (remaining, effective_now)
                 reset_after = max(0.0, (self.capacity - remaining) / self.refill_rate)
                 return RateLimitResult(
                     allowed=True,
-                    limit=int(self.capacity),
+                    limit=self.capacity,
                     remaining=remaining,
                     reset_after=reset_after,
                     retry_after=None
                 )
             else:
-                self._local_buckets[user_id] = (refilled, now)
+                self._local_buckets[user_id] = (refilled, effective_now)
                 reset_after = max(0.0, (self.capacity - refilled) / self.refill_rate)
                 retry_after = max(1, math.ceil((tokens - refilled) / self.refill_rate))
                 return RateLimitResult(
                     allowed=False,
-                    limit=int(self.capacity),
+                    limit=self.capacity,
                     remaining=refilled,
                     reset_after=reset_after,
                     retry_after=retry_after
                 )
 
-    def is_allowed(self, user_id: str, tokens: int = 1) -> bool:
-        return self.check_limit(user_id, tokens).allowed
+    def is_allowed(self, user_id: str, tokens: Union[int, float] = 1) -> bool:
+        try:
+            return self.check_limit(user_id, tokens).allowed
+        except ValueError as e:
+            if "exceeds maximum bucket capacity" in str(e):
+                return False
+            raise
 
     def is_redis_active(self) -> bool:
         """Helper to inspect Redis reachability."""

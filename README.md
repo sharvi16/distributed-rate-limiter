@@ -120,11 +120,14 @@ All responses set standard RFC and IETF rate-limiting headers:
 | `X-RateLimit-Reset` / `RateLimit-Reset` | Integer ceiling seconds until the bucket completely replenishes to full capacity: `ceil((capacity - remaining) / refill_rate)` | `18` |
 | `Retry-After` | Integer seconds the client must wait before retrying to have sufficient tokens: `max(1, ceil((tokens - remaining) / refill_rate))` (present on all `429 Too Many Requests` responses) | `6` |
 
-### Redis Server Wall-Clock Time Semantics & Assumptions
+### Redis Server Wall-Clock Time Semantics & Monotonic Recovery
 
 The rate limiter evaluates continuous refills inside an atomic Lua script using Redis server time (`redis.call('TIME')`):
 - **Server Wall-Clock Time (gettimeofday)**: Redis `TIME` returns host operating system wall-clock time (`CLOCK_REALTIME`), not a guaranteed hardware monotonic clock (`CLOCK_MONOTONIC`).
-- **Backward Jump Defense**: The Lua script strictly clamps delta intervals using `math.max(0, now - last_updated)`, preventing token underflows or state corruption if the host clock steps backward.
+- **Monotonic Clock Recovery**: To protect against backward time steps (NTP stepping, VM migration, leap seconds), both Redis Lua and local fallback compute `effective_now = math.max(now, last_updated)`. Elapsed time is strictly computed as `effective_now - last_updated`, and `effective_now` is persisted back to storage. This guarantees that `last_updated` is monotonically non-decreasing, preventing excess artificial token refills when the clock later catches up to normal time.
+- **Server-Controlled Request Costs**: Ordinary requests consume strictly 1.0 token (server-controlled). Public client-specified `tokens` query parameters are removed to prevent malicious clients from multiplying quotas using fractional amounts (e.g., `?tokens=0.01`).
+- **Oversized Token Requests**: A request demanding more tokens than bucket capacity is treated as invalid input (`ValueError` in `check_limit` and HTTP 400 Bad Request at the API layer), never HTTP 429 with a misleading `Retry-After`.
+- **Burst Capacity vs Sustained Refill Rate**: API telemetry and error messages explicitly distinguish instantaneous burst capacity (e.g., 10 tokens) from continuous sustained refill rates (e.g., 10.0 requests/minute).
 - **NTP Synchronization Requirements**: Production Redis hosts must run NTP in slew mode (e.g. `chrony` with slewing or `ntpd -x`) rather than abrupt step adjustments.
 - **Failover & Replication Assumptions**: In distributed Redis Sentinel or Cluster environments, primary and replica hosts must maintain clock synchronization (skew $< 10\,\text{ms}$). A promoted replica with clock skew will either temporarily pause refills until elapsed time catches up or refill up to total bucket capacity without overflow.
 
@@ -208,14 +211,14 @@ The stack launches:
 
 ## 🧪 Comprehensive Automated Test Suite
 
-The test suite contains **133 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
+The test suite contains **138 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
 
 ```bash
 pytest tests/ -v
 ```
 
 ### Test Categories:
-- **`tests/security/test_priority2_audit.py`** (24 tests): Numeric invariants & type safety (rejection of NaN, infinity, booleans, and non-positive numbers in rate limiter and spam detector), API query parameter validation (`GET /limited-resource?tokens=...`), dynamic environment variable configuration (`RATE_LIMITER_CAPACITY`, `RATE_LIMITER_REFILL_RATE`, `IP_RATE_LIMITER_CAPACITY`) with startup lifespan validation, Redis server wall-clock time semantics and backward clock step safeguards (`math.max(0, delta)`), RateLimitResult telemetry, and RFC/IETF header parity (`X-RateLimit-*`, `RateLimit-*`, and `Retry-After`).
+- **`tests/security/test_priority2_audit.py`** (29 tests): Server-controlled request costs (elimination of public `tokens` query parameters, ensuring strictly 1.0 token consumed per request and preventing fractional quota evasion), oversized token request handling (raising `ValueError` / returning HTTP 400 Bad Request on `tokens > capacity`, never HTTP 429), monotonic backward clock recovery in Redis Lua and local in-memory fallback (preventing artificial refills via monotonic `effective_now`), dynamic startup configuration synchronization via `sync_rate_limiter_configuration()`, telemetry precision (`RateLimitResult.limit` float preservation), and clear distinction between burst capacity and sustained refill rate in API responses and headers.
 - **`tests/security/test_admin_protection.py`** (15 tests): Admin key enforcement (fail-closed, missing/empty key denial, invalid key denial, valid key acceptance, UTF-8 byte constant-time comparison to prevent timing attacks and avoid 500 errors on non-ASCII input, single environment variable authoritative source with no stale global fallback, error message neutrality, production startup validation for existence/length/entropy/placeholders).
 - **`tests/security/test_priority1_audit.py`** (43 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy (Shannon entropy & diversity vs length), known placeholder blocklist, strict boolean configuration parsing, startup configuration validation through FastAPI lifespan, production vs development environment isolation, prohibition of unauthenticated headers in production, and identity anti-spoofing.
 - **`tests/unit/test_token_bucket.py`** (11 tests): Capacity, refill math, oversized requests, atomic concurrency, failure modes (`fail_closed`, `fail_open`, `local_fallback`), and RFC headers.
