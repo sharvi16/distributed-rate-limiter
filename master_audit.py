@@ -157,7 +157,10 @@ def run_master_audit():
     if r_trig.status_code == 403:
         ch = r_trig.json().get("detail", {}).get("challenge", {})
         cid = ch.get("challenge_id")
-        ans = ch.get("body_example", {}).get("answer")
+        import re
+        prompt_text = ch.get("prompt", "")
+        m = re.search(r"(\d+)\s*\+\s*(\d+)", prompt_text)
+        ans = str(int(m.group(1)) + int(m.group(2))) if m else "0"
         
         # Solve challenge
         r_solve = requests.post(f"{BASE_URL}/verify-challenge", json={"challenge_id": cid, "answer": ans})
@@ -302,7 +305,9 @@ def run_master_audit():
     pass_enforced = False
     if r_pv.status_code == 403:
         p_cid = r_pv.json().get("detail", {}).get("challenge", {}).get("challenge_id")
-        p_ans = r_pv.json().get("detail", {}).get("challenge", {}).get("body_example", {}).get("answer")
+        prompt_pv = r_pv.json().get("detail", {}).get("challenge", {}).get("prompt", "")
+        m_pv = re.search(r"(\d+)\s*\+\s*(\d+)", prompt_pv)
+        p_ans = str(int(m_pv.group(1)) + int(m_pv.group(2))) if m_pv else "0"
         requests.post(f"{BASE_URL}/verify-challenge", json={"challenge_id": p_cid, "answer": p_ans})
         # Now hammer remaining quota past 10
         pv_codes = []

@@ -13,6 +13,7 @@ import os
 import subprocess
 import requests
 import json
+import re
 
 BASE_URL = "http://127.0.0.1:8000"
 
@@ -111,11 +112,13 @@ def main():
 
     if challenge_data:
         cid = challenge_data.get("challenge_id")
-        ans = challenge_data.get("body_example", {}).get("answer")
+        prompt_text = challenge_data.get("prompt", "")
+        match = re.search(r"(\d+)\s*\+\s*(\d+)", prompt_text)
+        ans = str(int(match.group(1)) + int(match.group(2))) if match else "0"
         print(f"\n   [Self-Learning Step] Answering challenge {cid} with answer '{ans}'...")
         verify_res = requests.post(
             f"{BASE_URL}/verify-challenge",
-            json={"challenge_id": cid, "answer": ans}
+            json={"challenge_id": cid, "answer": ans, "user_id": "bob"}
         )
         print(f"   -> HTTP {verify_res.status_code}: {verify_res.json().get('message')}")
         print(f"   -> Feedback: {verify_res.json().get('self_learning')}")

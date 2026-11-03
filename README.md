@@ -1,72 +1,184 @@
 # Distributed Rate Limiter & Multi-Tier Abuse Defense System
 
-An enterprise-grade, distributed rate limiting and anti-abuse architecture built with **FastAPI**, **Redis**, the **Token Bucket algorithm**, and an **Online Self-Learning Anomaly Detection Engine**.
+A production-ready distributed rate limiting and defense-in-depth abuse mitigation system built with **FastAPI**, **Redis**, the **Token Bucket algorithm**, and an **Online Self-Learning Gaussian Anomaly Detection Engine**.
 
 ---
 
-## Security Architecture & Defenses
+## 🌟 Security Architecture & Execution Flow
+
+Incoming requests pass through a strictly prioritized, multi-tier evaluation pipeline before accessing protected resources:
 
 ```mermaid
 flowchart TD
-    Req[Incoming Request] --> PenaltyCheck{Tier 0: Penalty Box Check <br> User, IP, or Device Jailed?}
+    Req[Incoming HTTP Request] --> ResolveIP[Resolve Client IP via Trusted Proxy Chain]
+    ResolveIP --> PenaltyCheck{Tier 0: Penalty Box Check<br/>User, IP, or Device Jailed?}
     
-    PenaltyCheck -->|Jailed| BlockJail[HTTP 429: Access Blocked in Penalty Box]
-    PenaltyCheck -->|Clean| VPNHopping{Tier 1: VPN Hopping Check <br> >2 distinct IPs for single device in 60s?}
+    PenaltyCheck -->|Jailed| BlockJail[HTTP 429: Penalty Box Active<br/>Returns Retry-After Header]
+    PenaltyCheck -->|Clean| VPNHopping{Tier 1: VPN Hopping Check<br/>>2 distinct IPs for single device in 60s?}
     
-    VPNHopping -->|Yes: VPN Churn| JailDevice[HTTP 429: VPN Hopping Detected! <br> Device Jailed for 120s]
-    VPNHopping -->|Clean| SybilCheck{Tier 2: Sybil / ID Cycling Check <br> >3 distinct user-ids from single IP?}
+    VPNHopping -->|Yes: VPN Churn| JailDevice[HTTP 429: Device Jailed for 120s<br/>dev:... stored in Redis]
+    VPNHopping -->|Clean| SybilCheck{Tier 1: Sybil Attack Check<br/>>3 distinct user IDs from single IP in 60s?}
     
-    SybilCheck -->|Yes: Sybil Attack| JailIP[HTTP 429: Sybil Attack Detected! <br> IP Jailed for 120s]
-    SybilCheck -->|Clean| OuterIPLimit{Tier 3: Outer IP Guardrail <br> >30 reqs/min for physical IP?}
+    SybilCheck -->|Yes: ID Cycling| JailIP[HTTP 429: IP Jailed for 120s<br/>ip:... stored in Redis]
+    SybilCheck -->|Clean| OuterIPLimit{Tier 2: Outer IP Guardrail<br/>>30 req/min for physical IP?}
     
-    OuterIPLimit -->|Yes| BlockIP[HTTP 429: Physical IP Rate Limit Exceeded]
-    OuterIPLimit -->|Clean| UserQuota{Tier 4: User Token Bucket <br> >10 reqs/min for user_id?}
+    OuterIPLimit -->|Exceeded| BlockIP[HTTP 429: IP Rate Limit Exceeded]
+    OuterIPLimit -->|Clean| UserQuota{Tier 3: User Token Bucket<br/>Atomic Lua Evaluation<br/>Capacity: 10, Refill: 10/min}
     
-    UserQuota -->|No Tokens Left| BlockUser[HTTP 429: Rate Limit Exceeded: Quota Exhausted]
-    UserQuota -->|Tokens Available| VerifiedCheck{Tier 5: Verified Human Pass <br> Solved challenge in last 5 mins?}
+    UserQuota -->|No Tokens Left| BlockUser[HTTP 429: Quota Exhausted<br/>Returns X-RateLimit-* & Retry-After]
+    UserQuota -->|Tokens Available| VerifiedCheck{Tier 3: Verified Human Pass<br/>Active Pass in Redis / Memory?}
     
-    VerifiedCheck -->|Yes| AllowVerified[HTTP 200 OK: Allowed as Verified Human]
-    VerifiedCheck -->|No| MLBehavior[Tier 6: Behavioral ML Engine <br> Timing Jitter & Burst Analysis]
+    VerifiedCheck -->|Active Pass| AllowVerified[HTTP 200 OK: Allowed<br/>Verified Human Session Pass]
+    VerifiedCheck -->|Unverified| MLBehavior[Tier 4: Behavioral ML Classification<br/>Timing Jitter & Burst Frequency Analysis]
     
-    MLBehavior -->|Bot Machine Speed| JailBot[HTTP 429: Jailed for 60s]
-    MLBehavior -->|Suspicious Burst| IssueChallenge[HTTP 403: Verification Challenge Required]
-    MLBehavior -->|Natural Human Jitter| AllowHuman[HTTP 200 OK: Request Allowed]
+    MLBehavior -->|Bot Machine Speed| JailBot[HTTP 429: Jailed for 60s<br/>Model Trained on Bot Pattern]
+    MLBehavior -->|Suspicious Burst| IssueChallenge[HTTP 403: Single-Use Challenge Issued<br/>State Stored in Redis with 120s TTL]
+    MLBehavior -->|Natural Human Jitter| AllowHuman[HTTP 200 OK: Request Allowed<br/>Returns X-RateLimit-* Headers]
 
-    IssueChallenge -->|Solves Challenge| GrantPass[Unlocks 5-Min Verified Pass & Trains Model]
+    IssueChallenge -->|Valid Verification| GrantPass[Unlocks 5-Min Verified Pass & Updates Centroids]
 ```
 
 ---
 
-## Defenses Against Modern Attacks
+## 🛡️ Multi-Tier Defenses & Threat Model
 
-| Attack Vector | How It Works | How Our System Neutralizes It |
+| Defense Layer | Mechanism | Protection Provided | Limitations & Threat Boundaries |
+| :--- | :--- | :--- | :--- |
+| **Token Bucket Quota** | Atomic Redis Lua script using Redis server clock (`TIME`) | Strict ceiling on request throughput per authenticated `user_id` (10 req/min). | Application-layer only. Large-scale volumetric L3/L4 DDoS attacks require upstream scrubbing (Cloudflare, AWS Shield). |
+| **Physical IP Guardrail** | Outer Token Bucket tracking IP addresses (30 req/min) | Prevents runaway consumption from a single physical connection or network. | Shared public NATs (universities, corporate offices) share quota. Configurable via subnets. |
+| **Trusted Proxy Resolution** | Reverse proxy chain traversal (RFC 7239 compliant) | Rejects spoofed `X-Forwarded-For` headers from untrusted direct peers. | Requires operator to correctly configure `TRUSTED_PROXIES` CIDRs in production. |
+| **Sybil Attack Defense** | Atomic sliding window in Redis tracking `user_id` velocity per IP | Jails IP for 120s if $>3$ distinct user accounts are rotated within a 60-second window. | High-density NAT environments should tune `max_allowed_ids` or rely on user authentication tokens. |
+| **VPN Hopping Defense** | Sliding window tracking IP velocity per Device Fingerprint | Jails Device Fingerprint for 120s if a single client rotates across $>2$ IPs in 60 seconds. | Header-based device fingerprinting is heuristic; sophisticated attackers can spoof browser attributes. |
+| **Self-Learning Gaussian Anomaly Detector** | Bivariate Gaussian mixture tracking request interval jitter ($\sigma$) and burst sizes | Automatically flags zero-jitter robotic traffic and challenges suspicious micro-bursts. | Cold-start sensitivity is bounded by pre-seeded baseline centroids; model adapts online via verified feedback. |
+| **Challenge-Based Verification** | Single-use challenges with cryptographic IDs, Redis TTL (120s), and attempt caps (3 max) | Allows false-positive human traffic to prove legitimacy and calibrate Gaussian parameters online. | Arithmetic challenges serve as automated script friction and model calibration signals, NOT bulletproof proof-of-human CAPTCHAs. |
+| **Penalty Box Escalation** | Multi-target penalty lookup (`user_id`, `client_ip`, `device_id`) | Rapidly isolates abusive actors with geometric strike escalation (1x, 2x, 3x duration). | Stored with finite TTLs in Redis to prevent permanent lockout of reclaimed dynamic IPs. |
+
+---
+
+## ⚙️ Configurable Failure Modes
+
+When Redis becomes unreachable, the rate limiter adheres to an explicitly configured failure mode policy:
+
+1. **`fail_closed` (Default & Recommended)**:
+   - Rejects unthrottled requests with `503 Service Unavailable`.
+   - Recommended for high-security, paid API, or compute-intensive endpoints where uncontrolled traffic could crash backend dependencies.
+2. **`fail_open`**:
+   - Allows requests to proceed unthrottled during an outage.
+   - Suitable for mission-critical read endpoints prioritizing 100% availability over strict rate enforcement.
+3. **`local_fallback`**:
+   - Degrades to a thread-safe, memory-bounded (LRU/TTL) in-memory Token Bucket on each application worker.
+   - **Operational Note**: Local fallback does NOT provide globally consistent distributed enforcement. Multiple instances maintain independent quotas. When Redis recovers, local consumption is not reconciled with Redis state.
+
+---
+
+## 📊 Standard RFC Rate-Limit Headers
+
+All responses set standard IETF / RFC rate-limiting headers:
+
+| Header | Description | Example |
 | :--- | :--- | :--- |
-| **Volumetric DDoS** | Sending hundreds of requests per second. | **Token Bucket (10 reqs/min)** hard ceiling stops all traffic. |
-| **Robotic Scraping** | Bots sending rapid requests with machine-like timing ($<0.05$s gaps). | **Behavioral ML Timing Jitter ($\sigma$) Engine** detects zero-jitter metronomic timing and jails the bot on request #3. |
-| **Sybil Attack (User-ID Cycling)** | Script cycles through `user_1`, `user_2`, `user_3` to get 10 fresh tokens each time. | **Identity Velocity Tracker** detects $>3$ distinct IDs from one IP in 60s and **jails the physical IP**. |
-| **VPN / Proxy IP Rotation** | Attacker switches VPNs to rotate IP addresses. | **Device Fingerprinting & VPN Hopping Detector** detects a single device rotating across multiple IPs and **jails the Device Fingerprint (`dev_...`) for 120s**. Switching IPs will not unblock them! |
-| **CAPTCHA Hell for Humans** | Legitimate fast humans getting constantly challenged on every click. | **Verified Human Session Pass**: Solved challenge grants a 5-minute verified pass to browse smoothly under their 10-req quota. |
+| `X-RateLimit-Limit` | Maximum token burst capacity for the user | `10` |
+| `X-RateLimit-Remaining` | Remaining tokens available in the current window | `7` |
+| `X-RateLimit-Reset` | Seconds until the bucket refills to full capacity | `18` |
+| `Retry-After` | Seconds client must wait before retrying (present on all `429 Too Many Requests` responses) | `60` |
 
 ---
 
-## Quick Start & Testing
+## 📈 Prometheus Metrics & Observability
 
-### 1. Start the API Server
-```powershell
-.\.venv\Scripts\uvicorn.exe main:app --reload
+The application exposes real-time telemetry at `GET /metrics` in Prometheus text format (version 0.0.4):
+
+- `ratelimit_requests_total{status="allowed|rate_limited|jailed|challenge_required"}`
+- `ratelimit_redis_connected` (gauge: 1 = healthy, 0 = disconnected)
+- `ratelimit_jailed_total` (counter of penalty box jailing events)
+- `ratelimit_challenges_issued_total`
+- `ratelimit_challenges_verified_total`
+- `ratelimit_challenges_exhausted_total`
+- `ratelimit_sybil_attacks_detected_total`
+- `ratelimit_vpn_hopping_detected_total`
+- `ratelimit_model_version` (gauge tracking online learning iterations)
+
+---
+
+## 🔒 Administrative Endpoint Security
+
+The diagnostic endpoint `GET /model-stats` exposes active model centroids, evaluation counters, and jailed users.
+- In production, set `ADMIN_API_KEY` in your environment.
+- When configured, requests require the `x-admin-key: <ADMIN_API_KEY>` header (returns `401 Unauthorized` if invalid or missing).
+- If `ADMIN_API_KEY` is empty (default dev mode), open access is allowed for convenient inspection.
+
+---
+
+## 🚀 Quick Start & Deployment
+
+### Local Development Setup
+
+1. **Clone repository & set up virtual environment**:
+   ```bash
+   git clone https://github.com/sharvi16/distributed-rate-limiter.git
+   cd distributed-rate-limiter
+   python -m venv .venv
+   source .venv/bin/activate  # On Windows: .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   ```
+
+2. **Configure environment**:
+   ```bash
+   cp .env.example .env
+   ```
+
+3. **Start local Redis**:
+   ```bash
+   redis-server
+   ```
+
+4. **Run FastAPI with Uvicorn**:
+   ```bash
+   uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+   ```
+
+---
+
+### Docker & Docker Compose Deployment
+
+Run the complete multi-worker FastAPI application cluster and Redis service:
+
+```bash
+docker compose up --build
 ```
-Server runs at `http://127.0.0.1:8000`.
 
-### 2. Run Verification & Interactive Demo
+The stack launches:
+- **`redis`**: Redis 7 Alpine with Append-Only File (AOF) persistence and health checks.
+- **`api`**: Multi-worker FastAPI running as non-privileged `appuser` with automated health checks.
 
-#### A. Master Exhaustive Test Suite (20 Automated Security Checks)
-```powershell
-.\.venv\Scripts\python.exe master_audit.py
+---
+
+## 🧪 Comprehensive Automated Test Suite
+
+The test suite contains **51 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
+
+```bash
+pytest tests/ -v
 ```
-Audits all 8 dimensions: Infrastructure, Real Human browsing, Bot detection, Human Challenge solving & 5-min Verified Pass, Hard 10-req quota, Sybil Attack defense, VPN Hopping device lockout, and Fault-Tolerance Edge Cases.
 
-#### B. Interactive Terminal Demo
-```powershell
-.\.venv\Scripts\python.exe demo.py
+### Test Categories:
+- **`tests/unit/test_token_bucket.py`** (11 tests): Capacity, refill math, oversized requests, atomic concurrency, failure modes (`fail_closed`, `fail_open`, `local_fallback`), and RFC headers.
+- **`tests/unit/test_challenge.py`** (8 tests): Cryptographic ID generation, single-use enforcement, attempt exhaustion, user-session binding, and answer leak prevention.
+- **`tests/integration/test_model_sync.py`** (4 tests): Gaussian centroid persistence across restarts, cross-instance synchronization, and atomic EMA Lua updates.
+- **`tests/integration/test_identity_tracking.py`** (5 tests): Atomic sliding window Lua scripts, VPN hopping detection, Sybil attack velocity, and strike-based penalty escalation.
+- **`tests/integration/test_api_endpoints.py`** (5 tests): Rate limit headers, 429 retry-after behavior, admin key protection, and Prometheus `/metrics` scraping.
+- **`tests/security/test_header_spoofing.py`** (10 tests): Trusted proxy chain traversal, untrusted `X-Forwarded-For` rejection, CIDR subnet matching, and device fingerprint entropy.
+- **`tests/distributed/test_multiple_instances.py`** (4 tests): Multi-worker shared quota enforcement, cluster-wide penalty propagation, and distributed model synchronization.
+- **`tests/distributed/test_redis_failure.py`** (4 tests): Network partition simulation and graceful fallback behavior.
+
+---
+
+## ⚡ Performance Benchmarking
+
+A reproducible load testing tool is included to benchmark throughput and latency percentiles under high concurrency:
+
+```bash
+python benchmarks/load_test.py
 ```
-Simulates real humans, burst challenges, and robotic spammers in real-time with visual terminal outputs.
+
+Outputs duration, throughput (req/s), P50, P90, P99, Max latencies, and HTTP status code distribution.

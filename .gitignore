@@ -23,3 +23,6 @@ ENV/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Testing & Caches
+.pytest_cache/

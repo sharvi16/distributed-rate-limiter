@@ -1,11 +1,15 @@
-from fastapi import FastAPI, Header, HTTPException, status, Request
+from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Header, HTTPException, status, Request, Response, Depends
+import math
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import os
 import redis
 
-from rate_limiter import RateLimiter
+from rate_limiter import RateLimiter, FailureMode, RedisUnavailableError
 from spam_detector import AdaptiveSpamDetector
+from ip_utils import resolve_client_ip, parse_trusted_proxies
+from metrics import metrics_collector
 
 app = FastAPI(
     title="Distributed Rate Limiter with Self-Learning Spam Detection",
@@ -17,13 +21,20 @@ app = FastAPI(
 # Service Initializations
 # -----------------------------------------------------------------------------
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+trusted_proxies_cfg = os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1")
+TRUSTED_PROXIES = parse_trusted_proxies(trusted_proxies_cfg)
+failure_mode_str = os.getenv("RATE_LIMITER_FAILURE_MODE", FailureMode.FAIL_CLOSED.value)
+try:
+    configured_failure_mode = FailureMode(failure_mode_str.lower())
+except ValueError:
+    configured_failure_mode = FailureMode.FAIL_CLOSED
 
 # Initialize Token Bucket Rate Limiter (10 requests per minute with in-memory fallback)
 limiter = RateLimiter(
     redis_url=redis_url,
     capacity=10,
     refill_rate=10.0 / 60.0,
-    enable_fallback=True
+    failure_mode=configured_failure_mode
 )
 
 # Initialize Outer IP Guardrail Rate Limiter (30 requests per minute per physical IP)
@@ -31,12 +42,26 @@ ip_limiter = RateLimiter(
     redis_url=redis_url,
     capacity=30,
     refill_rate=30.0 / 60.0,
-    enable_fallback=True
+    failure_mode=configured_failure_mode
 )
 
 # Initialize Self-Learning Spam & Abuse Detector
 detector = AdaptiveSpamDetector(redis_client=limiter.redis)
 
+
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
+
+def verify_admin_key(x_admin_key: Optional[str] = Header(None, alias="x-admin-key")) -> bool:
+    """Protects internal model diagnostics and metrics from unauthorized inspection."""
+    if not ADMIN_API_KEY:
+        return True
+    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: invalid or missing 'x-admin-key' header."
+        )
+    return True
 
 # -----------------------------------------------------------------------------
 # Models
@@ -44,6 +69,7 @@ detector = AdaptiveSpamDetector(redis_client=limiter.redis)
 class ChallengeVerificationRequest(BaseModel):
     challenge_id: str
     answer: str
+    user_id: Optional[str] = None
 
 
 # -----------------------------------------------------------------------------
@@ -51,7 +77,7 @@ class ChallengeVerificationRequest(BaseModel):
 # -----------------------------------------------------------------------------
 
 @app.get("/")
-async def root():
+def root():
     return {
         "message": "Distributed Rate Limiter & Self-Learning Spam Detector API",
         "redis_connected": limiter.is_redis_active(),
@@ -60,14 +86,21 @@ async def root():
             "GET /limited-resource": "Protected resource with adaptive spam & rate limit evaluation",
             "POST /verify-challenge": "Verify challenge for suspicious users (triggers model self-learning)",
             "GET /model-stats": "Inspect learned model centroids and spam vs human metrics",
-            "GET /docs": "Interactive Swagger UI"
+            "GET /docs": "Interactive Swagger UI",
+            "GET /metrics": "Prometheus metrics exposition"
         }
     }
+@app.get("/metrics", response_class=PlainTextResponse)
+def get_metrics():
+    """Exposes system telemetry, request counters, and cluster health in Prometheus exposition format."""
+    return metrics_collector.generate_prometheus_output(limiter=limiter, detector=detector)
+
 
 
 @app.get("/limited-resource")
-async def limited_resource(
+def limited_resource(
     request: Request,
+    response: Response,
     user_id_dash: Optional[str] = Header(None, alias="user-id"),
     user_id_underscore: Optional[str] = Header(None, alias="user_id"),
     user_agent: Optional[str] = Header("", alias="user-agent")
@@ -91,9 +124,8 @@ async def limited_resource(
             detail="Header 'user-id' (or 'user_id') is required."
         )
 
-    # Extract client IP address (supports X-Forwarded-For for proxy/VPN simulation)
-    forwarded_for = request.headers.get("x-forwarded-for")
-    client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else (request.client.host if request.client else "127.0.0.1")
+    # Extract client IP address securely (supports trusted reverse proxies)
+    client_ip = resolve_client_ip(request, trusted_networks=TRUSTED_PROXIES)
 
     # Extract deterministic Device Fingerprint (Hardware Signature)
     device_id = detector.compute_device_fingerprint(request.headers, user_agent=user_agent or "")
@@ -103,6 +135,7 @@ async def limited_resource(
     # -------------------------------------------------------------------------
     is_jailed, remaining = detector.is_in_penalty_box(user_id, client_ip=client_ip, device_id=device_id)
     if is_jailed:
+        metrics_collector.inc_request("jailed")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
@@ -111,7 +144,8 @@ async def limited_resource(
                 "client_ip": client_ip,
                 "device_id": device_id,
                 "remaining_seconds": remaining
-            }
+            },
+            headers={"Retry-After": str(max(1, remaining))}
         )
 
     # -------------------------------------------------------------------------
@@ -120,6 +154,9 @@ async def limited_resource(
     # -------------------------------------------------------------------------
     is_vpn_hop, ip_count = detector.track_vpn_hopping(device_id, client_ip, max_allowed_ips=2)
     if is_vpn_hop:
+        metrics_collector.inc_vpn_hopping()
+        metrics_collector.inc_jailed()
+        metrics_collector.inc_request("jailed")
         detector.jail_user(f"dev:{device_id}", duration_seconds=120)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -128,7 +165,8 @@ async def limited_resource(
                 "device_id": device_id,
                 "client_ip": client_ip,
                 "distinct_ips_detected": ip_count
-            }
+            },
+            headers={"Retry-After": "120"}
         )
 
     # -------------------------------------------------------------------------
@@ -137,6 +175,9 @@ async def limited_resource(
     # -------------------------------------------------------------------------
     is_sybil, distinct_count = detector.track_identity_velocity(client_ip, user_id, max_allowed_ids=3)
     if is_sybil:
+        metrics_collector.inc_sybil()
+        metrics_collector.inc_jailed()
+        metrics_collector.inc_request("jailed")
         detector.jail_user(f"ip:{client_ip}", duration_seconds=120)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -144,7 +185,8 @@ async def limited_resource(
                 "message": f"Sybil Attack / ID Cycling detected: {distinct_count} distinct user IDs generated from this IP in under 60 seconds. IP jailed for 120s.",
                 "client_ip": client_ip,
                 "distinct_ids_detected": distinct_count
-            }
+            },
+            headers={"Retry-After": "120"}
         )
 
     # -------------------------------------------------------------------------
@@ -153,37 +195,51 @@ async def limited_resource(
     # -------------------------------------------------------------------------
     try:
         ip_allowed = ip_limiter.is_allowed(f"ip:{client_ip}")
-    except redis.RedisError:
+    except (redis.RedisError, RedisUnavailableError):
         ip_allowed = True
 
     if not ip_allowed:
+        metrics_collector.inc_request("rate_limited")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
                 "message": "Physical IP rate limit exceeded (30 requests per minute across all accounts). Try again later.",
                 "client_ip": client_ip
-            }
+            },
+            headers={"Retry-After": "60"}
         )
 
     # -------------------------------------------------------------------------
     # Tier 3: User Token Bucket Quota (10 requests / minute per user_id)
     # -------------------------------------------------------------------------
     try:
-        is_allowed = limiter.is_allowed(user_id)
-    except redis.RedisError:
+        rate_result = limiter.check_limit(user_id)
+    except (redis.RedisError, RedisUnavailableError):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Rate limiter service unavailable (Redis down)"
         )
 
-    if not is_allowed:
+    if not rate_result.allowed:
+        metrics_collector.inc_request("rate_limited")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
                 "message": "Rate limit exceeded (10 requests per minute). Quota exhausted. Try again later.",
                 "user_id": user_id
+            },
+            headers={
+                "X-RateLimit-Limit": str(rate_result.limit),
+                "X-RateLimit-Remaining": str(max(0, int(rate_result.remaining))),
+                "X-RateLimit-Reset": str(math.ceil(rate_result.reset_after)),
+                "Retry-After": str(rate_result.retry_after or 1)
             }
         )
+
+    # Attach standard RFC rate limit headers to successful evaluation
+    response.headers["X-RateLimit-Limit"] = str(rate_result.limit)
+    response.headers["X-RateLimit-Remaining"] = str(max(0, int(rate_result.remaining)))
+    response.headers["X-RateLimit-Reset"] = str(math.ceil(rate_result.reset_after))
 
     # If the user already has an unsolved challenge and continues hammering -> Auto-jail!
     if detector.has_pending_challenge(user_id):
@@ -202,6 +258,7 @@ async def limited_resource(
     # without repeated challenges, while still counting toward their 10-req quota.
     # -------------------------------------------------------------------------
     if detector.is_verified_human(user_id):
+        metrics_collector.inc_request("allowed")
         return {
             "message": "Request allowed (Verified Human Session)",
             "user_id": user_id,
@@ -216,6 +273,8 @@ async def limited_resource(
     risk_score, classification = detector.compute_risk_score(features, user_id=user_id)
 
     if classification == "spammer":
+        metrics_collector.inc_jailed()
+        metrics_collector.inc_request("jailed")
         detector.jail_user(user_id, duration_seconds=60)
         detector.update_model(features, label="spammer")
         raise HTTPException(
@@ -226,10 +285,13 @@ async def limited_resource(
                 "risk_score": risk_score,
                 "classification": classification,
                 "features": features
-            }
+            },
+            headers={"Retry-After": "60"}
         )
 
     if classification == "suspicious":
+        metrics_collector.inc_challenge_issued()
+        metrics_collector.inc_request("challenge_required")
         challenge = detector.generate_challenge(user_id, features)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -242,6 +304,7 @@ async def limited_resource(
             }
         )
 
+    metrics_collector.inc_request("allowed")
     return {
         "message": "Request allowed",
         "user_id": user_id,
@@ -252,7 +315,7 @@ async def limited_resource(
 
 
 @app.post("/verify-challenge")
-async def verify_challenge(payload: ChallengeVerificationRequest):
+def verify_challenge(payload: ChallengeVerificationRequest, user_id_header: Optional[str] = Header(None, alias="user-id")):
     """
     Submits an answer to a verification challenge.
     
@@ -261,7 +324,8 @@ async def verify_challenge(payload: ChallengeVerificationRequest):
         updating its internal Gaussian centroids online!
       - If answer is incorrect: The model learns the pattern belonged to a SPAMMER and jails the user.
     """
-    success, message = detector.verify_challenge(payload.challenge_id, payload.answer)
+    effective_user_id = (payload.user_id or user_id_header or "").strip()
+    success, message = detector.verify_challenge(payload.challenge_id, payload.answer, expected_user_id=effective_user_id)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -276,7 +340,7 @@ async def verify_challenge(payload: ChallengeVerificationRequest):
 
 
 @app.get("/model-stats")
-async def model_stats():
+def model_stats(authorized: bool = Depends(verify_admin_key)):
     """
     Inspect the live state of the self-learning spam detection engine,
     including learned centroids and evaluation metrics.
