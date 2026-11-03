@@ -89,14 +89,23 @@ jobs:
           docker compose --env-file .env.badauth up -d redis
 
           # Wait for Redis healthcheck
+          REDIS_HEALTHY=0
           for i in $(seq 1 15); do
             HEALTH=$(docker inspect --format='{{json .State.Health.Status}}' rate_limiter_redis 2>/dev/null || echo '"starting"')
             if [ "$HEALTH" = '"healthy"' ]; then
               echo "Redis is healthy."
+              REDIS_HEALTHY=1
               break
             fi
             sleep 2
           done
+
+          if [ $REDIS_HEALTHY -ne 1 ]; then
+            echo "REDIS STARTUP ERROR: Redis container failed to report healthy within timeout. Container state:"
+            docker inspect rate_limiter_redis 2>/dev/null || true
+            docker logs rate_limiter_redis 2>/dev/null || true
+            exit 1
+          fi
 
           # Launch API container with incorrect Redis credentials
           echo "Verifying API fails fast with bad Redis credentials..."
@@ -139,12 +148,15 @@ jobs:
             exit 1
           fi
 
-          if ! echo "$LOGS" | grep -qE "Rate limiter startup connectivity check failed|invalid username-password pair|AuthenticationError|authentication failed|NOAUTH Authentication required"; then
-            echo "SECURITY ERROR: API container exited for an unexpected reason (not Redis auth failure)!"
+          # Require an explicit Redis authentication rejection error (rejecting generic network/connectivity errors)
+          if ! echo "$LOGS" | grep -qE "redis\.exceptions\.AuthenticationError|invalid username-password pair|WRONGPASS"; then
+            echo "SECURITY ERROR: API container exited for an unexpected reason (not explicit Redis authentication rejection)!"
+            echo "Actual container logs:"
+            echo "$LOGS"
             exit 1
           fi
 
-          echo "VERIFIED: API container exited specifically due to Redis authentication failure."
+          echo "VERIFIED: API container exited specifically due to Redis authentication rejection."
 
           # Clean up badauth container state
           docker compose --env-file .env.badauth down -v

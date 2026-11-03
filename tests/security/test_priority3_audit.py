@@ -1096,48 +1096,119 @@ class TestRedisStartupConnectivityCheck:
         )
         assert limiter_fallback.verify_connection(timeout=0.5) is False
 
-    def test_verify_connection_respects_custom_timeout_and_fails_closed(self, monkeypatch):
-        """verify_connection(timeout) times out and raises RedisUnavailableError when ping exceeds timeout."""
+    def test_verify_connection_respects_custom_timeout_and_fails_closed(self):
+        """verify_connection(timeout) enforces socket timeout and raises RedisUnavailableError when connect/read times out."""
+        import socket
+        import threading
         import time
 
-        limiter = RateLimiter(
-            redis_url="redis://localhost:6379",
-            failure_mode=FailureMode.FAIL_CLOSED
-        )
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
 
-        def slow_ping():
-            time.sleep(0.3)
-            return True
+        def serve():
+            try:
+                client, _ = server.accept()
+                time.sleep(1.0)
+                client.close()
+            except Exception:
+                pass
 
-        monkeypatch.setattr(limiter.redis, "ping", slow_ping)
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
 
-        with pytest.raises(RedisUnavailableError) as exc_info:
-            limiter.verify_connection(timeout=0.05)
+        try:
+            limiter = RateLimiter(
+                redis_url=f"redis://127.0.0.1:{port}",
+                failure_mode=FailureMode.FAIL_CLOSED
+            )
+            with pytest.raises(RedisUnavailableError) as exc_info:
+                limiter.verify_connection(timeout=0.05)
 
-        err = str(exc_info.value)
-        assert "timed out after 0.05s" in err
+            err = str(exc_info.value)
+            assert "timed out after 0.05s" in err
+        finally:
+            server.close()
 
-    def test_verify_connection_timeout_returns_false_under_fail_open_and_fallback(self, monkeypatch):
-        """verify_connection(timeout) returns False without raising when slow ping occurs in fail_open/fallback."""
+    def test_verify_connection_timeout_returns_false_under_fail_open_and_fallback(self):
+        """verify_connection(timeout) returns False without raising when socket times out in fail_open/fallback."""
+        import socket
+        import threading
         import time
 
-        def slow_ping():
-            time.sleep(0.3)
-            return True
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(2)
+        port = server.getsockname()[1]
 
-        limiter_open = RateLimiter(
-            redis_url="redis://localhost:6379",
-            failure_mode=FailureMode.FAIL_OPEN
-        )
-        monkeypatch.setattr(limiter_open.redis, "ping", slow_ping)
-        assert limiter_open.verify_connection(timeout=0.05) is False
+        def serve():
+            while True:
+                try:
+                    client, _ = server.accept()
+                    time.sleep(1.0)
+                    client.close()
+                except Exception:
+                    break
 
-        limiter_fallback = RateLimiter(
-            redis_url="redis://localhost:6379",
-            failure_mode=FailureMode.LOCAL_FALLBACK
-        )
-        monkeypatch.setattr(limiter_fallback.redis, "ping", slow_ping)
-        assert limiter_fallback.verify_connection(timeout=0.05) is False
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+
+        try:
+            limiter_open = RateLimiter(
+                redis_url=f"redis://127.0.0.1:{port}",
+                failure_mode=FailureMode.FAIL_OPEN
+            )
+            assert limiter_open.verify_connection(timeout=0.05) is False
+
+            limiter_fallback = RateLimiter(
+                redis_url=f"redis://127.0.0.1:{port}",
+                failure_mode=FailureMode.LOCAL_FALLBACK
+            )
+            assert limiter_fallback.verify_connection(timeout=0.05) is False
+        finally:
+            server.close()
+
+    def test_verify_connection_repeated_timeouts_do_not_accumulate_threads(self):
+        """Repeated timed-out verify_connection calls do not leak background worker threads."""
+        import socket
+        import threading
+        import time
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(15)
+        port = server.getsockname()[1]
+
+        def serve():
+            while True:
+                try:
+                    client, _ = server.accept()
+                    time.sleep(1.0)
+                    client.close()
+                except Exception:
+                    break
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+
+        try:
+            limiter = RateLimiter(
+                redis_url=f"redis://127.0.0.1:{port}",
+                failure_mode=FailureMode.FAIL_CLOSED
+            )
+            initial_threads = threading.active_count()
+
+            for _ in range(10):
+                try:
+                    limiter.verify_connection(timeout=0.03)
+                except RedisUnavailableError:
+                    pass
+
+            # No worker threads should be left behind
+            assert threading.active_count() <= initial_threads
+        finally:
+            server.close()
 
     def test_verify_connection_rejects_invalid_timeout(self):
         """verify_connection() strictly validates timeout argument."""

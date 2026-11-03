@@ -33,11 +33,11 @@ Architectural Guarantees & Redis Time Semantics:
      and refresh key TTL without deducting, preserving correct accrued token state.
 """
 
-import concurrent.futures
 from enum import Enum
 import math
 import os
 import re
+import socket
 import threading
 import time
 import urllib.parse
@@ -643,7 +643,7 @@ class RateLimiter:
     def verify_connection(self, timeout: float = 1.0) -> bool:
         """
         Validates Redis reachability and authentication during application startup
-        using a bounded-time PING command.
+        using a bounded-time socket PING command without background worker threads.
 
         Under FAIL_CLOSED:
           - Raises RedisUnavailableError (with sanitized error messages) if Redis is
@@ -656,18 +656,30 @@ class RateLimiter:
             if self.failure_mode == FailureMode.FAIL_CLOSED:
                 raise RedisUnavailableError("Rate limiter service unavailable (Redis client not configured)")
             return False
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        conn = None
         try:
-            future = executor.submit(self.redis.ping)
-            return bool(future.result(timeout=timeout_val))
-        except concurrent.futures.TimeoutError as e:
+            # Enforce bounded Redis socket operation without background worker threads
+            pool = getattr(self.redis, "connection_pool", None)
+            if pool is not None and hasattr(pool, "connection_class") and hasattr(pool, "connection_kwargs"):
+                conn_class = pool.connection_class
+                conn_kwargs = dict(pool.connection_kwargs)
+                conn_kwargs["socket_connect_timeout"] = timeout_val
+                conn_kwargs["socket_timeout"] = timeout_val
+                conn = conn_class(**conn_kwargs)
+                conn.send_command("PING")
+                res = conn.read_response()
+                return bool(str(res).upper() in ("PONG", "TRUE", "OK", "1") or res is True)
+            else:
+                return bool(self.redis.ping())
+        except (redis.TimeoutError, TimeoutError, socket.timeout) as e:
             clean_err = f"Redis connectivity check timed out after {timeout_val}s"
             if self.failure_mode == FailureMode.FAIL_CLOSED:
                 raise RedisUnavailableError(
                     f"Rate limiter startup connectivity check failed: {clean_err}"
                 ) from e
             return False
-        except (redis.RedisError, TimeoutError, OSError) as e:
+        except (redis.RedisError, OSError) as e:
             clean_err = sanitize_redis_error_message(e)
             if self.failure_mode == FailureMode.FAIL_CLOSED:
                 raise RedisUnavailableError(
@@ -675,7 +687,11 @@ class RateLimiter:
                 ) from e
             return False
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            if conn is not None:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
 
     def _register_script(self):
         """Register the Lua script with Redis."""
