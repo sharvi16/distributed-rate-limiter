@@ -499,6 +499,208 @@ class TestRateLimiterConfigurationTransactional:
 
         assert not errors, f"Concurrent configuration update errors: {errors}"
 
+    def test_check_limit_uses_consistent_snapshot_during_concurrent_configure(self):
+        """
+        Under concurrent configure() calls, each check_limit() request must use
+        one complete configuration version without torn capacity/refill_rate snapshots.
+        """
+        import threading
+
+        rl = RateLimiter(
+            capacity=10.0,
+            refill_rate=1.0,
+            failure_mode=FailureMode.LOCAL_FALLBACK,
+            max_local_keys=1000
+        )
+        rl.redis = None
+        rl.check_limit_script = None
+
+        config_1 = (10.0, 1.0)
+        config_2 = (60.0, 2.0)
+
+        errors = []
+        stop_event = threading.Event()
+
+        def updater():
+            toggle = False
+            while not stop_event.is_set():
+                cfg = config_2 if toggle else config_1
+                toggle = not toggle
+                try:
+                    rl.configure(capacity=cfg[0], refill_rate=cfg[1])
+                except Exception as e:
+                    errors.append(e)
+
+        def worker(worker_id):
+            user = f"worker_{worker_id}"
+            while not stop_event.is_set():
+                try:
+                    res = rl.check_limit(user, tokens=1.0)
+                    if res.limit not in (10.0, 60.0):
+                        errors.append(ValueError(f"Invalid limit: {res.limit}"))
+                    expected_refill = 1.0 if res.limit == 10.0 else 2.0
+                    if res.remaining < res.limit and res.reset_after > 0:
+                        calculated_refill = (res.limit - res.remaining) / res.reset_after
+                        if not math.isclose(calculated_refill, expected_refill, rel_tol=1e-2):
+                            errors.append(ValueError(
+                                f"Torn snapshot detected: limit={res.limit}, remaining={res.remaining}, "
+                                f"reset_after={res.reset_after}, expected_refill={expected_refill}, "
+                                f"calculated_refill={calculated_refill}"
+                            ))
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=updater)] + [
+            threading.Thread(target=worker, args=(i,)) for i in range(4)
+        ]
+
+        for t in threads:
+            t.start()
+
+        time.sleep(0.4)
+        stop_event.set()
+
+        for t in threads:
+            t.join(timeout=2.0)
+
+        assert not errors, f"Snapshot consistency errors under concurrency: {errors}"
+
+    def test_redis_arguments_and_telemetry_match_exact_snapshot_under_concurrency(self):
+        """
+        When check_limit() passes arguments to Redis Lua during concurrent configure(),
+        the arguments and returned RateLimitResult.limit must belong to the exact same snapshot.
+        """
+        if not limiter.redis or not limiter.check_limit_script:
+            pytest.skip("Redis not available")
+
+        import threading
+
+        rl = RateLimiter(
+            capacity=10.0,
+            refill_rate=1.0,
+            failure_mode=FailureMode.FAIL_CLOSED,
+            redis_client=limiter.redis
+        )
+
+        config_1 = (10.0, 1.0)
+        config_2 = (60.0, 2.0)
+
+        errors = []
+        stop_event = threading.Event()
+
+        # Wrap check_limit_script to observe the actual args passed to Redis
+        original_script = rl.check_limit_script
+        call_records = []
+
+        def script_wrapper(keys, args):
+            cap = float(args[0])
+            refill = float(args[1])
+            if (cap, refill) not in (config_1, config_2):
+                errors.append(ValueError(f"Torn Redis args: cap={cap}, refill={refill}"))
+            call_records.append((cap, refill))
+            return original_script(keys=keys, args=args)
+
+        rl.check_limit_script = script_wrapper
+
+        def updater():
+            toggle = False
+            while not stop_event.is_set():
+                cfg = config_2 if toggle else config_1
+                toggle = not toggle
+                try:
+                    rl.configure(capacity=cfg[0], refill_rate=cfg[1])
+                except Exception as e:
+                    errors.append(e)
+
+        def worker(worker_id):
+            user = f"redis_snap_user_{worker_id}"
+            while not stop_event.is_set():
+                try:
+                    res = rl.check_limit(user, tokens=1.0)
+                    if res.limit not in (10.0, 60.0):
+                        errors.append(ValueError(f"Invalid result limit: {res.limit}"))
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=updater)] + [
+            threading.Thread(target=worker, args=(i,)) for i in range(4)
+        ]
+
+        for t in threads:
+            t.start()
+
+        time.sleep(0.4)
+        stop_event.set()
+
+        for t in threads:
+            t.join(timeout=2.0)
+
+        rl.check_limit_script = original_script
+
+        assert not errors, f"Redis snapshot parity errors under concurrency: {errors}"
+        assert len(call_records) > 0, "No Redis calls were recorded"
+
+    def test_max_local_keys_cleanup_during_concurrent_configuration_change(self):
+        """
+        When max_local_keys is dynamically reduced via configure() while requests arrive,
+        cache eviction executes without deadlock, KeyError, or exceeding reasonable bounds.
+        """
+        import threading
+
+        rl = RateLimiter(
+            capacity=10.0,
+            refill_rate=1.0,
+            failure_mode=FailureMode.LOCAL_FALLBACK,
+            max_local_keys=100
+        )
+        rl.redis = None
+        rl.check_limit_script = None
+
+        # Pre-seed 80 local buckets
+        for i in range(80):
+            rl._local_buckets[f"preseed_user_{i}"] = (10.0, time.time())
+
+        errors = []
+        stop_event = threading.Event()
+
+        def shrink_updater():
+            toggle = False
+            while not stop_event.is_set():
+                new_max = 20 if toggle else 50
+                toggle = not toggle
+                try:
+                    rl.configure(max_local_keys=new_max)
+                except Exception as e:
+                    errors.append(e)
+                time.sleep(0.02)
+
+        def request_worker(worker_id):
+            idx = 0
+            while not stop_event.is_set():
+                idx += 1
+                uid = f"worker_{worker_id}_user_{idx}"
+                try:
+                    rl.check_limit(uid, tokens=1.0)
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=shrink_updater)] + [
+            threading.Thread(target=request_worker, args=(i,)) for i in range(4)
+        ]
+
+        for t in threads:
+            t.start()
+
+        time.sleep(0.4)
+        stop_event.set()
+
+        for t in threads:
+            t.join(timeout=2.0)
+
+        assert not errors, f"Errors during concurrent max_local_keys cleanup: {errors}"
+        with rl._lock:
+            assert len(rl._local_buckets) <= 80
+
 
 # =============================================================================
 # 4. Redis Clock Semantics & Monotonic Backward Shift Recovery (Priority 2, Item 2)

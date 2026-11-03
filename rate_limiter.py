@@ -84,6 +84,19 @@ class RateLimitResult:
     retry_after: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class _ConfigSnapshot:
+    """
+    Immutable snapshot of RateLimiter configuration for a single request evaluation.
+    Guarantees that a request uses one consistent version of capacity, refill_rate,
+    failure_mode, and max_local_keys even if configure() is called concurrently.
+    """
+    capacity: float
+    refill_rate: float
+    failure_mode: FailureMode
+    max_local_keys: int
+
+
 # -----------------------------------------------------------------------------
 # Numeric Validation & Configuration Helpers (Priority 2)
 # -----------------------------------------------------------------------------
@@ -372,6 +385,20 @@ class RateLimiter:
             except Exception:
                 self.check_limit_script = None
 
+    def _get_config_snapshot(self) -> _ConfigSnapshot:
+        """
+        Reads capacity, refill_rate, failure_mode, and max_local_keys together under self._lock.
+        Returns an immutable _ConfigSnapshot guaranteeing that the caller operates on a consistent,
+        non-torn configuration version even during concurrent configure() mutations.
+        """
+        with self._lock:
+            return _ConfigSnapshot(
+                capacity=self.capacity,
+                refill_rate=self.refill_rate,
+                failure_mode=self.failure_mode,
+                max_local_keys=self.max_local_keys
+            )
+
     def check_limit(self, user_id: str, tokens: Union[int, float] = 1) -> RateLimitResult:
         """
         Evaluates rate limit and returns detailed telemetry including remaining tokens,
@@ -383,43 +410,59 @@ class RateLimiter:
 
         tokens = validate_tokens_requested(tokens)
 
-        if tokens > self.capacity:
+        # 1. Obtain consistent configuration snapshot under lock
+        snapshot = self._get_config_snapshot()
+
+        # 2. Validate requested tokens against snapshot capacity
+        if tokens > snapshot.capacity:
             raise ValueError(
-                f"tokens requested ({tokens}) exceeds maximum bucket capacity ({self.capacity})"
+                f"tokens requested ({tokens}) exceeds maximum bucket capacity ({snapshot.capacity})"
             )
 
+        # 3. Evaluate limit via Redis Lua script if reachable
         if self.redis and self.check_limit_script:
             key = f"rate_limit:{user_id}"
             try:
                 result = self.check_limit_script(
                     keys=[key],
-                    args=[self.capacity, self.refill_rate, tokens]
+                    args=[snapshot.capacity, snapshot.refill_rate, tokens]
                 )
                 allowed = bool(result[0] == 1)
                 remaining = max(0.0, float(result[1]))
-                reset_after = max(0.0, (self.capacity - remaining) / self.refill_rate)
-                retry_after = max(1, math.ceil((tokens - remaining) / self.refill_rate)) if not allowed else None
+                reset_after = max(0.0, (snapshot.capacity - remaining) / snapshot.refill_rate)
+                retry_after = max(1, math.ceil((tokens - remaining) / snapshot.refill_rate)) if not allowed else None
                 return RateLimitResult(
                     allowed=allowed,
-                    limit=self.capacity,
+                    limit=snapshot.capacity,
                     remaining=remaining,
                     reset_after=reset_after,
                     retry_after=retry_after
                 )
             except (redis.RedisError, redis.ConnectionError, TimeoutError, OSError) as e:
-                return self._handle_check_limit_failure(user_id, tokens, e)
+                return self._handle_check_limit_failure(user_id, tokens, e, snapshot=snapshot)
 
-        return self._handle_check_limit_failure(user_id, tokens, ConnectionError("Redis is not connected"))
+        return self._handle_check_limit_failure(
+            user_id, tokens, ConnectionError("Redis is not connected"), snapshot=snapshot
+        )
     
-    def _handle_check_limit_failure(self, user_id: str, tokens: Union[int, float], error: Exception) -> RateLimitResult:
-        if self.failure_mode == FailureMode.FAIL_CLOSED:
+    def _handle_check_limit_failure(
+        self,
+        user_id: str,
+        tokens: Union[int, float],
+        error: Exception,
+        snapshot: Optional[_ConfigSnapshot] = None
+    ) -> RateLimitResult:
+        if snapshot is None:
+            snapshot = self._get_config_snapshot()
+
+        if snapshot.failure_mode == FailureMode.FAIL_CLOSED:
             raise RedisUnavailableError(f"Rate limiter service unavailable (Redis down: {error})") from error
 
-        if self.failure_mode == FailureMode.FAIL_OPEN:
+        if snapshot.failure_mode == FailureMode.FAIL_OPEN:
             return RateLimitResult(
                 allowed=True,
-                limit=self.capacity,
-                remaining=self.capacity,
+                limit=snapshot.capacity,
+                remaining=snapshot.capacity,
                 reset_after=0.0,
                 retry_after=None
             )
@@ -427,39 +470,41 @@ class RateLimiter:
         # LOCAL_FALLBACK Mode
         now = time.time()
         with self._lock:
-            if len(self._local_buckets) > self.max_local_keys:
+            # Enforce memory bounds using live configured max_local_keys under lock
+            effective_max_keys = self.max_local_keys
+            if len(self._local_buckets) > effective_max_keys:
                 cutoff = now - 3600.0
                 stale_keys = [k for k, (_, last_t) in self._local_buckets.items() if last_t < cutoff]
                 for k in stale_keys:
                     del self._local_buckets[k]
-                if len(self._local_buckets) > self.max_local_keys:
+                if len(self._local_buckets) > effective_max_keys:
                     sorted_items = sorted(self._local_buckets.items(), key=lambda item: item[1][1])
-                    for k, _ in sorted_items[: int(self.max_local_keys * 0.2)]:
+                    for k, _ in sorted_items[: int(effective_max_keys * 0.2)]:
                         del self._local_buckets[k]
 
-            current_tokens, last_updated = self._local_buckets.get(user_id, (self.capacity, now))
+            current_tokens, last_updated = self._local_buckets.get(user_id, (snapshot.capacity, now))
             effective_now = max(now, last_updated)
             delta = effective_now - last_updated
-            refilled = min(self.capacity, current_tokens + (delta * self.refill_rate))
+            refilled = min(snapshot.capacity, current_tokens + (delta * snapshot.refill_rate))
 
             if refilled >= tokens:
                 remaining = refilled - tokens
                 self._local_buckets[user_id] = (remaining, effective_now)
-                reset_after = max(0.0, (self.capacity - remaining) / self.refill_rate)
+                reset_after = max(0.0, (snapshot.capacity - remaining) / snapshot.refill_rate)
                 return RateLimitResult(
                     allowed=True,
-                    limit=self.capacity,
+                    limit=snapshot.capacity,
                     remaining=remaining,
                     reset_after=reset_after,
                     retry_after=None
                 )
             else:
                 self._local_buckets[user_id] = (refilled, effective_now)
-                reset_after = max(0.0, (self.capacity - refilled) / self.refill_rate)
-                retry_after = max(1, math.ceil((tokens - refilled) / self.refill_rate))
+                reset_after = max(0.0, (snapshot.capacity - refilled) / snapshot.refill_rate)
+                retry_after = max(1, math.ceil((tokens - refilled) / snapshot.refill_rate))
                 return RateLimitResult(
                     allowed=False,
-                    limit=self.capacity,
+                    limit=snapshot.capacity,
                     remaining=refilled,
                     reset_after=reset_after,
                     retry_after=retry_after
