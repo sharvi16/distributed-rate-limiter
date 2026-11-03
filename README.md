@@ -10,7 +10,9 @@ Incoming requests pass through a strictly prioritized, multi-tier evaluation pip
 
 ```mermaid
 flowchart TD
-    Req[Incoming HTTP Request] --> ResolveIP[Resolve Client IP via Trusted Proxy Chain]
+    Req[Incoming HTTP Request] --> AuthCheck{Authentication & Principal Resolution<br/>Bearer Token or API Key}
+    AuthCheck -->|Invalid / Missing| Reject401[HTTP 401: Unauthorized]
+    AuthCheck -->|Verified Principal| ResolveIP[Resolve Client IP via Trusted Proxy Chain]
     ResolveIP --> PenaltyCheck{Tier 0: Penalty Box Check<br/>User, IP, or Device Jailed?}
     
     PenaltyCheck -->|Jailed| BlockJail[HTTP 429: Penalty Box Active<br/>Returns Retry-After Header]
@@ -44,14 +46,37 @@ flowchart TD
 
 | Defense Layer | Mechanism | Protection Provided | Limitations & Threat Boundaries |
 | :--- | :--- | :--- | :--- |
+| **Authentication & Principal Resolution** | HMAC-SHA256 token verification with constant-time comparison, expiry (3600s), and clock skew limits | Binds user quotas to verified cryptographic identities. Rejects forged, unsigned (`usr_*`, `token_*`), or expired credentials. | Requires secure distribution of `AUTH_SECRET_KEY` (minimum 32 characters / 256 bits). |
 | **Token Bucket Quota** | Atomic Redis Lua script using Redis server clock (`TIME`) | Strict ceiling on request throughput per authenticated `user_id` (10 req/min). | Application-layer only. Large-scale volumetric L3/L4 DDoS attacks require upstream scrubbing (Cloudflare, AWS Shield). |
 | **Physical IP Guardrail** | Outer Token Bucket tracking IP addresses (30 req/min) | Prevents runaway consumption from a single physical connection or network. | Shared public NATs (universities, corporate offices) share quota. Configurable via subnets. |
 | **Trusted Proxy Resolution** | Reverse proxy chain traversal (RFC 7239 compliant) | Rejects spoofed `X-Forwarded-For` headers from untrusted direct peers. | Requires operator to correctly configure `TRUSTED_PROXIES` CIDRs in production. |
 | **Sybil Attack Defense** | Atomic sliding window in Redis tracking `user_id` velocity per IP | Jails IP for 120s if $>3$ distinct user accounts are rotated within a 60-second window. | High-density NAT environments should tune `max_allowed_ids` or rely on user authentication tokens. |
 | **VPN Hopping Defense** | Sliding window tracking IP velocity per Device Fingerprint | Jails Device Fingerprint for 120s if a single client rotates across $>2$ IPs in 60 seconds. | Header-based device fingerprinting is heuristic; sophisticated attackers can spoof browser attributes. |
 | **Self-Learning Gaussian Anomaly Detector** | Bivariate Gaussian mixture tracking request interval jitter ($\sigma$) and burst sizes | Automatically flags zero-jitter robotic traffic and challenges suspicious micro-bursts. | Cold-start sensitivity is bounded by pre-seeded baseline centroids; model adapts online via verified feedback. |
-| **Challenge-Based Verification** | Single-use challenges with cryptographic IDs, Redis TTL (120s), and attempt caps (3 max) | Allows false-positive human traffic to prove legitimacy and calibrate Gaussian parameters online. | Arithmetic challenges serve as automated script friction and model calibration signals, NOT bulletproof proof-of-human CAPTCHAs. |
+| **Challenge-Based Verification** | Single-use challenges with cryptographic IDs, Redis TTL (120s), and attempt caps (3 max) | Allows false-positive human traffic to prove legitimacy and calibrate Gaussian parameters online. Binds verification strictly to authenticated principal. | Arithmetic challenges serve as automated script friction and model calibration signals, NOT bulletproof proof-of-human CAPTCHAs. |
 | **Penalty Box Escalation** | Multi-target penalty lookup (`user_id`, `client_ip`, `device_id`) | Rapidly isolates abusive actors with geometric strike escalation (1x, 2x, 3x duration). | Stored with finite TTLs in Redis to prevent permanent lockout of reclaimed dynamic IPs. |
+
+---
+
+## 🔑 Authentication & Identity Security
+
+Production deployments strictly require cryptographic authentication (`REQUIRE_AUTH=true` by default):
+
+1. **HMAC-SHA256 Bearer Tokens**:
+   - Format: `<user_id>:<timestamp>:<signature>`
+   - Generated with `create_signed_token(user_id)`.
+   - Verified via `verify_signed_token(token)` using `hmac.compare_digest` (timing-attack resistant).
+2. **Token Lifetime & Skew Enforcement**:
+   - Default lifetime: 3600 seconds (1 hour). Expired tokens return `401 Unauthorized`.
+   - Future timestamps exceeding 60 seconds clock skew are rejected.
+3. **No Unsigned Tokens**:
+   - Unsigned shorthand patterns like `token_<user_id>` or `usr_<user_id>` are strictly rejected.
+4. **Anti-Spoofing & Unified Endpoints**:
+   - Both `/limited-resource` and `/verify-challenge` share the exact same `get_authenticated_principal` dependency.
+   - When an authenticated token is present, any client-supplied `user-id` header or body payload is ignored. The rate-limiting and challenge-verification identity is derived exclusively from the verified principal.
+5. **Secret Key Entropy Validation**:
+   - `AUTH_SECRET_KEY` must have a minimum length of 32 characters (256 bits).
+   - In production, missing or weak keys abort startup with an explicit configuration error. Secrets are never logged.
 
 ---
 
@@ -61,6 +86,7 @@ When Redis becomes unreachable, the rate limiter adheres to an explicitly config
 
 1. **`fail_closed` (Default & Recommended)**:
    - Rejects unthrottled requests with `503 Service Unavailable`.
+   - Applied consistently across both user and physical IP rate limiters.
    - Recommended for high-security, paid API, or compute-intensive endpoints where uncontrolled traffic could crash backend dependencies.
 2. **`fail_open`**:
    - Allows requests to proceed unthrottled during an outage.
@@ -155,13 +181,14 @@ The stack launches:
 
 ## 🧪 Comprehensive Automated Test Suite
 
-The test suite contains **51 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
+The test suite contains **77 exhaustive unit, integration, distributed, and security tests** executed via Pytest:
 
 ```bash
 pytest tests/ -v
 ```
 
 ### Test Categories:
+- **`tests/security/test_priority1_audit.py`** (26 tests): Redis failure modes at API level, challenge session binding, cryptographic token verification (HMAC-SHA256, expiry, future skew, unsigned token rejection), secret key entropy, production authentication defaults, and identity anti-spoofing.
 - **`tests/unit/test_token_bucket.py`** (11 tests): Capacity, refill math, oversized requests, atomic concurrency, failure modes (`fail_closed`, `fail_open`, `local_fallback`), and RFC headers.
 - **`tests/unit/test_challenge.py`** (8 tests): Cryptographic ID generation, single-use enforcement, attempt exhaustion, user-session binding, and answer leak prevention.
 - **`tests/integration/test_model_sync.py`** (4 tests): Gaussian centroid persistence across restarts, cross-instance synchronization, and atomic EMA Lua updates.

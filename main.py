@@ -9,7 +9,7 @@ import redis
 from rate_limiter import RateLimiter, FailureMode, RedisUnavailableError
 from spam_detector import AdaptiveSpamDetector
 from ip_utils import resolve_client_ip, parse_trusted_proxies
-from auth import get_authenticated_principal, AuthenticatedPrincipal, verify_signed_token, REQUIRE_AUTH
+from auth import get_authenticated_principal, AuthenticatedPrincipal
 from metrics import metrics_collector
 
 app = FastAPI(
@@ -315,41 +315,17 @@ def limited_resource(
 @app.post("/verify-challenge")
 def verify_challenge(
     payload: ChallengeVerificationRequest,
-    authorization: Optional[str] = Header(None, alias="authorization"),
-    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
-    user_id_header: Optional[str] = Header(None, alias="user-id")
+    principal: AuthenticatedPrincipal = Depends(get_authenticated_principal)
 ):
     """
     Submits an answer to a verification challenge.
     
-    Requires a valid authenticated identity (via Bearer token, API key, or user-id header in dev mode).
-    Binds challenge verification strictly to the authenticated principal to prevent identity hijacking.
+    Authentication & Ownership:
+      - Uses the exact same get_authenticated_principal dependency as /limited-resource.
+      - Binds challenge verification strictly to the authenticated principal.
+      - payload.user_id or client headers can NEVER override the authenticated principal.
     """
-    effective_user_id = ""
-    if authorization:
-        parts = authorization.strip().split(maxsplit=1)
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            effective_user_id = verify_signed_token(parts[1].strip()) or ""
-            if not effective_user_id:
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token.")
-        else:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Malformed Authorization header.")
-    elif x_api_key:
-        effective_user_id = verify_signed_token(x_api_key.strip()) or ""
-        if not effective_user_id:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key.")
-    elif REQUIRE_AUTH:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication credentials required.")
-    else:
-        # Fallback in unauthenticated development mode
-        effective_user_id = (payload.user_id or user_id_header or "").strip()
-
-    if not effective_user_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Challenge verification requires a valid authenticated identity."
-        )
-
+    effective_user_id = principal.user_id
     success, message = detector.verify_challenge(payload.challenge_id, payload.answer, expected_user_id=effective_user_id)
     if not success:
         raise HTTPException(

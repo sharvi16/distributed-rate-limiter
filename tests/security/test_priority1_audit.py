@@ -4,10 +4,14 @@ Priority 1 Security Regression Tests.
 Covers:
   1. Redis failure modes at the API level (FAIL_CLOSED, FAIL_OPEN, LOCAL_FALLBACK).
   2. Challenge session binding (omitted identities, mismatched users, replay attacks) in Redis and local fallback.
-  3. Identity trust & authenticated principals: verifying credentials take precedence over client-supplied headers.
-  4. Device fingerprinting limitations: verifying header-derived heuristic nature.
+  3. Cryptographic token verification (rejection of usr_*, token_*, arbitrary strings, tampered signatures, expired, future).
+  4. Signing secret entropy and strict production validation (missing/weak key rejection).
+  5. Production authentication defaults (REQUIRE_AUTH=true, 401 rejection, dev header lockdown).
+  6. Identity trust & anti-spoofing across both /limited-resource and /verify-challenge endpoints.
+  7. Device fingerprinting limitations: verifying header-derived heuristic nature.
 """
 
+import time
 import uuid
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +20,14 @@ import main
 from main import app, limiter, ip_limiter, detector
 from rate_limiter import RateLimiter, FailureMode, RedisUnavailableError
 from spam_detector import AdaptiveSpamDetector
-from auth import create_signed_token, verify_signed_token, AuthenticatedPrincipal
+from auth import (
+    create_signed_token,
+    verify_signed_token,
+    get_auth_secret_key,
+    is_auth_required,
+    is_dev_headers_allowed,
+    AuthenticatedPrincipal
+)
 
 
 class UnreachableRedisMock:
@@ -30,7 +41,6 @@ class UnreachableRedisMock:
         def _fail(*args, **kwargs):
             raise redis.ConnectionError("Simulated Redis outage")
         return _fail
-
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +58,7 @@ def clean_test_state():
             detector._local_ip_identities.pop("testclient", None)
         if hasattr(detector, "_local_penalties"):
             detector._local_penalties.pop("ip:testclient", None)
+
 
 @pytest.fixture
 def client():
@@ -165,13 +176,14 @@ class TestChallengeSessionBinding:
         assert "different user session" in msg
 
     def test_api_verify_challenge_requires_identity(self, client):
-        """POST /verify-challenge without identity must return 400 Bad Request."""
+        """POST /verify-challenge without identity must return 400 or 401."""
         response = client.post(
             "/verify-challenge",
             json={"challenge_id": "ch_dummy_12345", "answer": "42"}
         )
-        assert response.status_code == 400
-        assert "valid authenticated identity" in response.json()["detail"]
+        assert response.status_code in (400, 401)
+        detail = str(response.json().get("detail", ""))
+        assert any(k in detail for k in ("Missing authentication", "Authentication required", "valid authenticated identity"))
 
     def test_api_verify_challenge_mismatched_identity_rejected(self, client):
         """Solving User A's challenge with User B's identity must be rejected."""
@@ -205,18 +217,148 @@ class TestChallengeSessionBinding:
 
 
 # =============================================================================
-# 3. Identity Trust & Authenticated Principal Enforcement
+# 3. Cryptographic Token Verification & Unsigned Token Rejection
 # =============================================================================
-class TestIdentityTrustAndAuthentication:
-    def test_authenticated_principal_derivation_from_bearer_token(self):
-        token = create_signed_token("verified_alice")
-        assert verify_signed_token(token) == "verified_alice"
+class TestCryptographicTokenVerification:
+    def test_forged_unsigned_token_usr_admin_rejected(self):
+        """Shallow shorthand 'usr_admin' must be unconditionally rejected."""
+        assert verify_signed_token("usr_admin") is None
+        assert verify_signed_token("usr_alice") is None
 
-    def test_tampered_token_rejected(self):
-        token = create_signed_token("verified_alice")
-        # Tamper with the user_id portion
-        tampered = "verified_bob" + token[len("verified_alice"):]
-        assert verify_signed_token(tampered) is None
+    def test_forged_unsigned_token_token_admin_rejected(self):
+        """Shallow shorthand 'token_admin' must be unconditionally rejected."""
+        assert verify_signed_token("token_admin") is None
+        assert verify_signed_token("token_12345") is None
+
+    def test_arbitrary_strings_rejected(self):
+        """Arbitrary strings or malformed inputs must be rejected."""
+        assert verify_signed_token("arbitrary_string_123") is None
+        assert verify_signed_token("") is None
+        assert verify_signed_token(None) is None
+        assert verify_signed_token("user:notatimestamp:sig") is None
+        assert verify_signed_token("user:12345") is None
+
+    def test_valid_signed_token_accepted(self):
+        """Valid HMAC-SHA256 signed token within validity window must be accepted."""
+        user = f"user_{uuid.uuid4().hex[:6]}"
+        token = create_signed_token(user)
+        assert verify_signed_token(token) == user
+
+    def test_tampered_token_signature_rejected(self):
+        """Any modification to user_id, timestamp, or signature must invalidate the token."""
+        user = "verified_alice"
+        token = create_signed_token(user)
+        parts = token.split(":")
+        
+        # Tamper user
+        tampered_user = f"verified_bob:{parts[1]}:{parts[2]}"
+        assert verify_signed_token(tampered_user) is None
+
+        # Tamper timestamp
+        tampered_ts = f"{parts[0]}:{int(parts[1]) + 10}:{parts[2]}"
+        assert verify_signed_token(tampered_ts) is None
+
+        # Tamper signature hex
+        tampered_sig = f"{parts[0]}:{parts[1]}:{'a' * 64}"
+        assert verify_signed_token(tampered_sig) is None
+
+    def test_expired_token_rejected(self):
+        """Tokens older than max_age_seconds must be rejected."""
+        user = "alice_expired"
+        now = int(time.time())
+        # Token generated 3601 seconds ago (max_age is 3600)
+        expired_token = create_signed_token(user, timestamp=now - 3601)
+        assert verify_signed_token(expired_token, max_age_seconds=3600) is None
+
+        # Token within window (3500 seconds ago) must still be accepted
+        valid_token = create_signed_token(user, timestamp=now - 3500)
+        assert verify_signed_token(valid_token, max_age_seconds=3600) == user
+
+    def test_future_dated_token_rejected(self):
+        """Tokens with future timestamps exceeding clock skew window must be rejected."""
+        user = "alice_future"
+        now = int(time.time())
+        # Token timestamped 120 seconds into the future (clock skew allowed is 60s)
+        future_token = create_signed_token(user, timestamp=now + 120)
+        assert verify_signed_token(future_token, allowed_clock_skew=60) is None
+
+        # Token timestamped 20 seconds into the future (within 60s skew) is accepted
+        slight_skew_token = create_signed_token(user, timestamp=now + 20)
+        assert verify_signed_token(slight_skew_token, allowed_clock_skew=60) == user
+
+
+# =============================================================================
+# 4. Signing Secret Security, Entropy & Startup Validation
+# =============================================================================
+class TestSigningSecretSecurityAndEntropy:
+    def test_missing_signing_secret_in_production_raises_runtime_error(self, monkeypatch):
+        """In production environment without dev overrides, missing AUTH_SECRET_KEY must raise RuntimeError."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
+        monkeypatch.setenv("AUTH_SECRET_KEY", "")
+
+        with pytest.raises(RuntimeError) as exc_info:
+            get_auth_secret_key()
+        assert "CRITICAL SECURITY CONFIGURATION ERROR" in str(exc_info.value)
+        assert "AUTH_SECRET_KEY" in str(exc_info.value)
+
+    def test_weak_signing_secret_in_production_raises_value_error(self, monkeypatch):
+        """In production environment, an AUTH_SECRET_KEY shorter than 32 characters must raise ValueError."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
+        monkeypatch.setenv("AUTH_SECRET_KEY", "too-short-secret")
+
+        with pytest.raises(ValueError) as exc_info:
+            get_auth_secret_key()
+        assert "insufficient length" in str(exc_info.value)
+        assert "Minimum required length is 32 characters" in str(exc_info.value)
+
+    def test_strong_signing_secret_accepted(self, monkeypatch):
+        """A 32+ character key is valid and accepted."""
+        strong_key = "x" * 32
+        monkeypatch.setenv("AUTH_SECRET_KEY", strong_key)
+        assert get_auth_secret_key() == strong_key
+
+
+# =============================================================================
+# 5. Production Authentication Defaults & Endpoint Enforcement
+# =============================================================================
+class TestProductionAuthDefaultsAndEndpointEnforcement:
+    def test_default_production_auth_requirement(self, monkeypatch):
+        """When REQUIRE_AUTH is unset, is_auth_required() must evaluate to True (secure default)."""
+        monkeypatch.delenv("REQUIRE_AUTH", raising=False)
+        assert is_auth_required() is True
+
+    def test_unauthenticated_request_rejected_with_401_when_auth_required(self, client, monkeypatch):
+        """When REQUIRE_AUTH is true, calling /limited-resource without credentials must return 401."""
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        response = client.get("/limited-resource")
+        assert response.status_code == 401
+        assert "Authentication required" in response.json()["detail"]
+
+    def test_unauthenticated_verify_challenge_rejected_with_401_when_auth_required(self, client, monkeypatch):
+        """When REQUIRE_AUTH is true, calling /verify-challenge without credentials must return 401."""
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        response = client.post(
+            "/verify-challenge",
+            json={"challenge_id": "ch_dummy_12345", "answer": "42"}
+        )
+        assert response.status_code == 401
+        assert "Authentication required" in response.json()["detail"]
+
+    def test_dev_headers_ignored_when_auth_required(self, client, monkeypatch):
+        """
+        When REQUIRE_AUTH is true, client-supplied user-id header is ignored and returns 401,
+        even if ALLOW_UNAUTHENTICATED_DEV_HEADERS is true.
+        """
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "true")
+        assert is_dev_headers_allowed() is False
+
+        response = client.get("/limited-resource", headers={"user-id": "attacker_user"})
+        assert response.status_code == 401
 
     def test_client_cannot_change_identity_via_headers_when_authenticated(self, client):
         """
@@ -240,7 +382,6 @@ class TestIdentityTrustAndAuthentication:
             }
         )
         assert res.status_code == 200
-        # Check response details: user_id must be Alice, never Bob
         data = res.json()
         assert data["user_id"] == alice
 
@@ -250,9 +391,31 @@ class TestIdentityTrustAndAuthentication:
             # Bob's key must NOT exist at all in Redis (completely untouched)
             assert limiter.redis.exists(f"rate_limit:{victim_bob}") == 0
 
+    def test_verify_challenge_ignores_payload_user_id_when_authenticated(self, client):
+        """
+        When authenticated via token, /verify-challenge resolves identity strictly
+        from the token and ignores any payload user_id mismatch.
+        """
+        det = AdaptiveSpamDetector(redis_client=limiter.redis)
+        user_alice = f"alice_{uuid.uuid4().hex[:6]}"
+        ch = det.generate_challenge(user_alice, {"interval_std": 0.1, "burst_count": 3, "mean_interval": 0.5})
+        cid = ch["challenge_id"]
+        true_answer = limiter.redis.hget(f"challenge:{cid}", "expected_answer")
+
+        token_alice = create_signed_token(user_alice)
+
+        # Alice submits with payload mentioning "some_other_id"
+        res = client.post(
+            "/verify-challenge",
+            headers={"Authorization": f"Bearer {token_alice}"},
+            json={"challenge_id": cid, "answer": true_answer, "user_id": "some_other_id"}
+        )
+        assert res.status_code == 200
+        assert res.json()["success"] is True
+
 
 # =============================================================================
-# 4. Device Fingerprint Heuristic Verification
+# 6. Device Fingerprint Heuristic Verification
 # =============================================================================
 class TestDeviceFingerprintHeuristicLimitations:
     def test_fingerprint_changes_with_untrusted_client_headers(self):
