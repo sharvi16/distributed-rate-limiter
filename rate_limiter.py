@@ -9,10 +9,12 @@ Architectural Guarantees & Redis Time Semantics:
        host operating system (CLOCK_REALTIME), which is NOT a guaranteed hardware monotonic
        clock (CLOCK_MONOTONIC). It reflects wall-clock time and is subject to system clock
        adjustments, NTP stepping or slewing, and leap seconds.
-     - Backward Jump Defense: To protect against negative elapsed time intervals caused by NTP steps
-       or backward clock shifts, the Lua script strictly clamps delta calculation:
-       `local delta = math.max(0, now - last_updated)`
-       ensuring accrued tokens cannot underflow or be erased by backward clock shifts.
+     - Monotonic Backward Jump Recovery: To protect against negative elapsed time intervals and prevent
+       excess artificial refills when the host clock later recovers, the Lua script strictly calculates:
+       `local effective_now = math.max(now, last_updated)`
+       `local delta = effective_now - last_updated`
+       persisting `effective_now` back to Redis. This guarantees that `last_updated` never decreases,
+       preventing artificial token refills when host time catches up.
      - Clock Adjustment Assumptions: Production Redis instances should run NTP in slew mode (e.g.
        using chrony with slewing or ntpd `-x`) to adjust time continuously rather than in abrupt steps.
      - Failover & Replica Assumptions: In distributed Redis setups (Sentinel / Cluster), failover
@@ -210,9 +212,14 @@ class RateLimiter:
 
     -- 1. Obtain server wall-clock time from Redis (gettimeofday, CLOCK_REALTIME).
     -- Note: Server wall-clock time eliminates client drift across distributed application nodes.
-    -- Non-monotonic steps are safeguarded below via monotonic effective_now = math.max(now, last_updated).
-    local time_val = redis.call('TIME')
-    local now = tonumber(time_val[1]) + (tonumber(time_val[2]) / 1000000)
+    -- Monotonic backward recovery is safeguarded below via monotonic effective_now = math.max(now, last_updated).
+    local now
+    if ARGV[4] then
+        now = tonumber(ARGV[4])
+    else
+        local time_val = redis.call('TIME')
+        now = tonumber(time_val[1]) + (tonumber(time_val[2]) / 1000000)
+    end
 
     -- 2. Fetch current bucket state
     local state = redis.call('HMGET', key, 'tokens', 'last_updated')
@@ -303,18 +310,43 @@ class RateLimiter:
     ) -> None:
         """
         Dynamically updates rate limiter configuration in place.
-        Validates arguments prior to mutating instance state.
+        Validates all supplied arguments into temporary variables first.
+        Applies changes under instance lock only if all validations succeed (all-or-nothing transactional update).
         """
+        new_capacity = None
         if capacity is not None:
-            self.capacity = validate_positive_number("capacity", capacity)
+            new_capacity = validate_positive_number("capacity", capacity)
+
+        new_refill_rate = None
         if refill_rate is not None:
-            self.refill_rate = validate_positive_number("refill_rate", refill_rate)
+            new_refill_rate = validate_positive_number("refill_rate", refill_rate)
+
+        new_max_local_keys = None
         if max_local_keys is not None:
-            self.max_local_keys = validate_positive_int("max_local_keys", max_local_keys)
+            new_max_local_keys = validate_positive_int("max_local_keys", max_local_keys)
+
+        new_failure_mode = None
         if failure_mode is not None:
             if isinstance(failure_mode, str):
-                failure_mode = FailureMode(failure_mode.lower())
-            self.failure_mode = failure_mode
+                try:
+                    new_failure_mode = FailureMode(failure_mode.lower())
+                except ValueError:
+                    raise ValueError(f"Invalid failure_mode: {failure_mode!r}")
+            elif isinstance(failure_mode, FailureMode):
+                new_failure_mode = failure_mode
+            else:
+                raise ValueError(f"failure_mode must be FailureMode or str, got {type(failure_mode).__name__}")
+
+        # All validations passed; atomically mutate instance state under lock
+        with self._lock:
+            if new_capacity is not None:
+                self.capacity = new_capacity
+            if new_refill_rate is not None:
+                self.refill_rate = new_refill_rate
+            if new_max_local_keys is not None:
+                self.max_local_keys = new_max_local_keys
+            if new_failure_mode is not None:
+                self.failure_mode = new_failure_mode
 
     def _init_redis(self):
         """Initialize Redis connection and register Lua script."""

@@ -389,6 +389,117 @@ class TestEnvironmentConfiguration:
             ip_limiter.configure(capacity=orig_ip_cap, refill_rate=30.0/60.0)
 
 
+class TestRateLimiterConfigurationTransactional:
+    """Tests transactional integrity and thread safety of RateLimiter.configure()."""
+
+    def test_configure_rejects_partial_mutation_on_invalid_arguments(self):
+        """
+        When configure() receives multiple parameters where one is valid and another invalid,
+        it must raise ValueError without mutating ANY attributes (all-or-nothing transactional update).
+        """
+        rl = RateLimiter(
+            capacity=10.0,
+            refill_rate=1.0,
+            failure_mode=FailureMode.FAIL_CLOSED,
+            max_local_keys=5000
+        )
+
+        # 1. Valid capacity (25.0) paired with invalid refill_rate (-2.0)
+        with pytest.raises(ValueError, match="refill_rate must be a positive number"):
+            rl.configure(capacity=25.0, refill_rate=-2.0)
+        assert rl.capacity == 10.0
+        assert rl.refill_rate == 1.0
+
+        # 2. Valid capacity (30.0) paired with invalid failure_mode string
+        with pytest.raises(ValueError, match="Invalid failure_mode"):
+            rl.configure(capacity=30.0, failure_mode="not_a_mode")
+        assert rl.capacity == 10.0
+        assert rl.failure_mode == FailureMode.FAIL_CLOSED
+
+        # 3. Invalid capacity (0) paired with valid max_local_keys (10000)
+        with pytest.raises(ValueError, match="capacity must be a positive number"):
+            rl.configure(capacity=0, max_local_keys=10000)
+        assert rl.capacity == 10.0
+        assert rl.max_local_keys == 5000
+
+        # 4. Invalid failure_mode type paired with valid refill_rate
+        with pytest.raises(ValueError, match="failure_mode must be FailureMode or str"):
+            rl.configure(refill_rate=2.0, failure_mode=12345)  # type: ignore
+        assert rl.refill_rate == 1.0
+
+        # 5. Clean valid update succeeds completely
+        rl.configure(capacity=20.0, refill_rate=2.0, failure_mode=FailureMode.LOCAL_FALLBACK, max_local_keys=2000)
+        assert rl.capacity == 20.0
+        assert rl.refill_rate == 2.0
+        assert rl.failure_mode == FailureMode.LOCAL_FALLBACK
+        assert rl.max_local_keys == 2000
+
+    def test_configure_concurrent_updates_thread_safety(self):
+        """
+        Concurrent threads updating configuration and checking limits must not cause race conditions,
+        corrupted/torn attributes, or deadlocks.
+        """
+        import threading
+
+        rl = RateLimiter(
+            capacity=10.0,
+            refill_rate=1.0,
+            failure_mode=FailureMode.LOCAL_FALLBACK,
+            max_local_keys=1000
+        )
+        rl.redis = None
+        rl.check_limit_script = None
+
+        config_a = (10.0, 1.0, FailureMode.FAIL_CLOSED, 1000)
+        config_b = (50.0, 5.0, FailureMode.LOCAL_FALLBACK, 5000)
+
+        errors = []
+        stop_event = threading.Event()
+
+        def updater(cfg):
+            while not stop_event.is_set():
+                try:
+                    rl.configure(capacity=cfg[0], refill_rate=cfg[1], failure_mode=cfg[2], max_local_keys=cfg[3])
+                except Exception as e:
+                    errors.append(e)
+
+        def reader():
+            while not stop_event.is_set():
+                try:
+                    with rl._lock:
+                        cap = rl.capacity
+                        refill = rl.refill_rate
+                        if cap == 10.0 and refill != 1.0:
+                            errors.append(ValueError(f"Torn state detected: cap={cap}, refill={refill}"))
+                        elif cap == 50.0 and refill != 5.0:
+                            errors.append(ValueError(f"Torn state detected: cap={cap}, refill={refill}"))
+                    try:
+                        rl.check_limit("concurrent_user", tokens=1.0)
+                    except Exception as e:
+                        if "Redis is not connected" not in str(e):
+                            errors.append(e)
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [
+            threading.Thread(target=updater, args=(config_a,)),
+            threading.Thread(target=updater, args=(config_b,)),
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+        ]
+
+        for t in threads:
+            t.start()
+
+        time.sleep(0.3)
+        stop_event.set()
+
+        for t in threads:
+            t.join(timeout=2.0)
+
+        assert not errors, f"Concurrent configuration update errors: {errors}"
+
+
 # =============================================================================
 # 4. Redis Clock Semantics & Monotonic Backward Shift Recovery (Priority 2, Item 2)
 # =============================================================================
@@ -471,31 +582,107 @@ class TestRedisClockSemanticsAndSafeguards:
         finally:
             time_mod.time = orig_time
 
-    def test_redis_lua_monotonic_clock_recovery_persists_effective_timestamp(self):
-        """Verifies Redis Lua persists effective_now when clock is behind last_updated."""
-        if not limiter.redis or not limiter.check_limit_script:
+    def test_redis_lua_complete_backward_clock_and_recovery_sequence(self):
+        """
+        Executes the exact Redis Lua script on Redis across the full backward-clock and recovery sequence:
+          Stage 1 (T=1000.0): Consume 2 tokens -> remaining=8.0, last_updated=1000.0 stored in Redis.
+          Stage 2 (T=950.0, -50s clock step): Request 1 token -> delta clamped to 0, remaining=7.0,
+                  last_updated persists 1000.0 in Redis (never regresses to 950.0).
+          Stage 3 (T=1000.0, clock catches up): Request 1 token -> delta is 0, zero artificial refill,
+                  remaining=6.0, last_updated=1000.0 stored in Redis.
+          Stage 4 (T=1003.0, clock advances normally 3s): Request 1 token -> 3 tokens refilled,
+                  remaining=8.0, last_updated updates to 1003.0 in Redis.
+        """
+        if not limiter.redis:
             pytest.skip("Redis not available")
 
-        user = f"redis_clock_test_{uuid.uuid4().hex[:6]}"
+        user = f"redis_clock_seq_{uuid.uuid4().hex[:6]}"
         key = f"rate_limit:{user}"
         limiter.reset(user)
 
-        # Simulate that Redis clock was at a future timestamp (e.g. 9999999999.0)
-        future_timestamp = 9999999999.0
-        limiter.redis.hset(key, mapping={"tokens": "8.0", "last_updated": str(future_timestamp)})
+        script = limiter.redis.register_script(RateLimiter.LUA_TOKEN_BUCKET)
+        capacity = 10.0
+        refill_rate = 1.0
 
-        # Check limit against live Redis: current wall clock (< future_timestamp)
-        # Lua computes effective_now = math.max(now, 9999999999.0) = 9999999999.0, delta = 0
-        res = limiter.check_limit(user, tokens=1.0)
-        assert res.allowed is True
-        assert res.remaining == 7.0
+        try:
+            # Stage 1: T=1000.0, consume 2 tokens
+            res1 = script(keys=[key], args=[capacity, refill_rate, 2.0, 1000.0])
+            assert res1[0] == 1
+            assert float(res1[1]) == 8.0
+            state1 = limiter.redis.hmget(key, "tokens", "last_updated")
+            assert float(state1[0]) == 8.0
+            assert float(state1[1]) == 1000.0
 
-        # Verify Redis state persisted effective_now, never regressing to current wall clock
-        persisted = limiter.redis.hgetall(key)
-        assert float(persisted["last_updated"]) == future_timestamp
+            # Stage 2: Clock steps backward to T=950.0 (-50s)
+            res2 = script(keys=[key], args=[capacity, refill_rate, 1.0, 950.0])
+            assert res2[0] == 1
+            assert float(res2[1]) == 7.0
+            state2 = limiter.redis.hmget(key, "tokens", "last_updated")
+            assert float(state2[0]) == 7.0
+            # Crucial: effective_now was persisted, NOT 950.0
+            assert float(state2[1]) == 1000.0
 
-        # Cleanup
-        limiter.redis.delete(key)
+            # Stage 3: Clock catches up to T=1000.0
+            res3 = script(keys=[key], args=[capacity, refill_rate, 1.0, 1000.0])
+            assert res3[0] == 1
+            assert float(res3[1]) == 6.0
+            state3 = limiter.redis.hmget(key, "tokens", "last_updated")
+            assert float(state3[0]) == 6.0
+            assert float(state3[1]) == 1000.0
+
+            # Stage 4: Clock advances normally to T=1003.0 (3s elapsed)
+            res4 = script(keys=[key], args=[capacity, refill_rate, 1.0, 1003.0])
+            assert res4[0] == 1
+            # Refilled: min(10.0, 6.0 + 3.0*1.0) = 9.0; minus 1.0 requested = 8.0
+            assert float(res4[1]) == 8.0
+            state4 = limiter.redis.hmget(key, "tokens", "last_updated")
+            assert float(state4[0]) == 8.0
+            assert float(state4[1]) == 1003.0
+        finally:
+            limiter.redis.delete(key)
+
+    def test_redis_live_clock_backward_jump_and_catchup(self):
+        """
+        Tests live Redis server time execution via check_limit() across backward shift and recovery:
+        verifies that setting last_updated ahead clamps refills and persists monotonic timestamp until clock catches up.
+        """
+        if not limiter.redis or not limiter.check_limit_script:
+            pytest.skip("Redis not available")
+
+        user = f"redis_live_clock_{uuid.uuid4().hex[:6]}"
+        key = f"rate_limit:{user}"
+        limiter.reset(user)
+
+        try:
+            # Initial consumption: consumes 2 tokens
+            res1 = limiter.check_limit(user, tokens=2.0)
+            assert res1.allowed is True
+            state1 = limiter.redis.hmget(key, "tokens", "last_updated")
+            last_t = float(state1[1])
+
+            # Simulate clock step backward: advance last_updated in Redis by 1.0 second
+            future_t = last_t + 1.0
+            limiter.redis.hset(key, mapping={"tokens": "8.0", "last_updated": str(future_t)})
+
+            # Immediate request: live Redis TIME is behind future_t
+            res2 = limiter.check_limit(user, tokens=1.0)
+            assert res2.allowed is True
+            assert res2.remaining == 7.0
+            state2 = limiter.redis.hmget(key, "tokens", "last_updated")
+            # Persisted effective_now is still future_t
+            assert float(state2[1]) == future_t
+
+            # Wait 1.1s for live Redis server clock to naturally catch up and pass future_t
+            time.sleep(1.1)
+
+            # Request after live clock caught up: should refill normally
+            res3 = limiter.check_limit(user, tokens=1.0)
+            assert res3.allowed is True
+            state3 = limiter.redis.hmget(key, "tokens", "last_updated")
+            # Now last_updated has advanced past future_t
+            assert float(state3[1]) > future_t
+        finally:
+            limiter.redis.delete(key)
 
 
 # =============================================================================
