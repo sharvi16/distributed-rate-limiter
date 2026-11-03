@@ -34,9 +34,12 @@ async def lifespan(app: FastAPI):
     FastAPI lifespan handler executing startup configuration validation and synchronization.
     Ensures authentication, encryption keys, admin secrets, and rate limiter
     environment variables are verified and synchronized before accepting incoming HTTP requests.
+    Validates Redis connectivity and authentication with a bounded-time PING.
     """
     validate_auth_configuration()
     sync_rate_limiter_configuration()
+    limiter.verify_connection(timeout=1.0)
+    ip_limiter.verify_connection(timeout=1.0)
     yield
 
 

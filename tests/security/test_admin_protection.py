@@ -248,6 +248,8 @@ class TestAdminStartupValidation:
         monkeypatch.setenv("REQUIRE_AUTH", "true")
         monkeypatch.setenv("AUTH_SECRET_KEY", secrets.token_hex(32))
         monkeypatch.setenv("ADMIN_API_KEY", secrets.token_hex(32))
+        monkeypatch.setenv("REDIS_AUTH_MODE", "network_isolated")
+        monkeypatch.setenv("ATTEST_NETWORK_ISOLATED_REDIS", "true")
         monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
 
         # Validation must complete without raising

@@ -407,6 +407,8 @@ class TestStartupConfigurationValidation:
         monkeypatch.delenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", raising=False)
         monkeypatch.setenv("AUTH_SECRET_KEY", secrets.token_hex(32))
         monkeypatch.setenv("ADMIN_API_KEY", secrets.token_hex(32))
+        monkeypatch.setenv("REDIS_AUTH_MODE", "network_isolated")
+        monkeypatch.setenv("ATTEST_NETWORK_ISOLATED_REDIS", "true")
 
         # Must run to completion without raising
         validate_auth_configuration()
@@ -485,6 +487,8 @@ class TestProductionDevHeaderProhibitionAndEnvironmentIsolation:
         monkeypatch.setenv("ENVIRONMENT", "production")
         monkeypatch.setenv("AUTH_SECRET_KEY", valid_key)
         monkeypatch.setenv("ADMIN_API_KEY", valid_key)
+        monkeypatch.setenv("REDIS_AUTH_MODE", "network_isolated")
+        monkeypatch.setenv("ATTEST_NETWORK_ISOLATED_REDIS", "true")
 
         # Combo 1: (False, False) -> Rejected
         monkeypatch.setenv("REQUIRE_AUTH", "false")

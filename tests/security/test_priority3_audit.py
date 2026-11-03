@@ -26,6 +26,8 @@ Covers:
 import os
 import re
 import uuid
+import tempfile
+import urllib.parse
 from typing import Any, Optional
 import multiprocessing as mp
 import pytest
@@ -407,6 +409,27 @@ class TestDeploymentAndConfigurationHardening:
 # 4. Redis Authentication & Password Handling Integration
 # =============================================================================
 
+@pytest.fixture
+def live_protected_redis():
+    """Sets up live local Redis with requirepass and guarantees clean reset in finally."""
+    secret = "test_redis_prod_secret_token_12345"
+    r = redis.Redis(host="localhost", port=6379, socket_timeout=1.0)
+    try:
+        r.ping()
+    except Exception:
+        pytest.skip("Local Redis server not available on localhost:6379 for live auth test")
+
+    r.config_set("requirepass", secret)
+    try:
+        yield secret
+    finally:
+        try:
+            r_authed = redis.Redis(host="localhost", port=6379, password=secret, socket_timeout=1.0)
+            r_authed.config_set("requirepass", "")
+        except Exception:
+            pass
+
+
 class TestRedisAuthenticationIntegration:
     """
     Real Redis integration tests using live CONFIG SET requirepass.
@@ -414,26 +437,6 @@ class TestRedisAuthenticationIntegration:
     missing or incorrect credentials fail closed, embedded credentials are preserved,
     and secrets never leak in logs, string representations, or exceptions.
     """
-
-    @pytest.fixture
-    def live_protected_redis(self):
-        """Sets up live local Redis with requirepass and guarantees clean reset in finally."""
-        secret = "test_redis_prod_secret_token_12345"
-        r = redis.Redis(host="localhost", port=6379, socket_timeout=1.0)
-        try:
-            r.ping()
-        except Exception:
-            pytest.skip("Local Redis server not available on localhost:6379 for live auth test")
-
-        r.config_set("requirepass", secret)
-        try:
-            yield secret
-        finally:
-            try:
-                r_authed = redis.Redis(host="localhost", port=6379, password=secret, socket_timeout=1.0)
-                r_authed.config_set("requirepass", "")
-            except Exception:
-                pass
 
     def test_authenticated_redis_connection_accepted(self, live_protected_redis):
         """RateLimiter connects and executes Lua script successfully with correct password."""
@@ -561,6 +564,50 @@ class TestRedisAuthenticationIntegration:
         assert limiter.is_redis_active() is True
         assert limiter.check_limit(f"reconfigured_user_{uuid.uuid4().hex[:8]}").allowed is True
 
+    def test_percent_encoded_url_credentials_with_special_characters(self):
+        """
+        Verifies that percent-encoded credentials containing special characters
+        (@, :, /, ?, #, %, +) in REDIS_URL are properly normalized and accepted without
+        contradiction, and that credentials are NEVER exposed in diagnostics.
+        """
+        secret = "p@ss:w/ord?#%+ "
+        r = redis.Redis(host="localhost", port=6379, socket_timeout=1.0)
+        try:
+            r.ping()
+        except Exception:
+            pytest.skip("Local Redis server not available on localhost:6379 for live special characters test")
+
+        r.config_set("requirepass", secret)
+        try:
+            encoded_secret = urllib.parse.quote(secret, safe="")
+            url_with_encoded_auth = f"redis://default:{encoded_secret}@localhost:6379/0"
+
+            # 1. Matches env password without false contradiction error
+            limiter = RateLimiter(
+                redis_url=url_with_encoded_auth,
+                redis_password=secret,
+                capacity=10,
+                refill_rate=1.0,
+                failure_mode=FailureMode.FAIL_CLOSED
+            )
+            assert limiter.is_redis_active() is True
+            res = limiter.check_limit(f"user_special_{uuid.uuid4().hex[:8]}")
+            assert res.allowed is True
+
+            # 2. Diagnostics mask all special characters cleanly
+            masked = limiter.masked_redis_url
+            assert masked == "redis://default:***@localhost:6379/0"
+            assert secret not in masked
+            assert encoded_secret not in masked
+            assert secret not in str(limiter)
+            assert secret not in repr(limiter)
+        finally:
+            try:
+                r_reset = redis.Redis(host="localhost", port=6379, password=secret, socket_timeout=1.0)
+                r_reset.config_set("requirepass", "")
+            except Exception:
+                pass
+
 
 # =============================================================================
 # 5. Redis Startup Validation
@@ -569,19 +616,33 @@ class TestRedisAuthenticationIntegration:
 class TestRedisStartupValidation:
     """Validates startup-time configuration enforcement for Redis authentication."""
 
-    def test_production_fails_when_redis_auth_required_but_missing(self, monkeypatch):
-        """Production startup fails if REDIS_AUTH_REQUIRED=true but no credentials are provided."""
+    def test_production_default_requires_redis_auth(self, monkeypatch):
+        """Production requires Redis authentication by default even if REDIS_AUTH_REQUIRED is unset."""
         monkeypatch.setenv("ENVIRONMENT", "production")
         monkeypatch.setenv("REQUIRE_AUTH", "true")
         monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
         monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
         monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
         monkeypatch.setenv("PROTECT_METRICS", "true")
-        monkeypatch.setenv("REDIS_AUTH_REQUIRED", "true")
+        monkeypatch.delenv("REDIS_AUTH_REQUIRED", raising=False)
+        monkeypatch.delenv("REQUIRE_REDIS_AUTH", raising=False)
         monkeypatch.delenv("REDIS_PASSWORD", raising=False)
         monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
 
-        with pytest.raises(RuntimeError, match="Redis authentication is required in production"):
+        with pytest.raises(RuntimeError, match="Redis authentication is mandatory in production by default"):
+            validate_auth_configuration()
+
+    def test_production_rejects_redis_auth_required_false(self, monkeypatch):
+        """Production strictly prohibits setting REDIS_AUTH_REQUIRED=false without an attested alternative."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
+        monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
+        monkeypatch.setenv("PROTECT_METRICS", "true")
+        monkeypatch.setenv("REDIS_AUTH_REQUIRED", "false")
+
+        with pytest.raises(ValueError, match="REDIS_AUTH_REQUIRED cannot be set to false in a production environment"):
             validate_auth_configuration()
 
     def test_production_fails_when_redis_password_is_placeholder(self, monkeypatch):
@@ -610,31 +671,191 @@ class TestRedisStartupValidation:
         with pytest.raises(ValueError, match="insufficient length"):
             validate_auth_configuration()
 
-    def test_production_succeeds_with_architectural_exception(self, monkeypatch):
-        """Production startup succeeds without password if an architectural exception is documented."""
+    def test_development_permits_passwordless_redis(self, monkeypatch):
+        """Development explicitly permits passwordless Redis and REDIS_AUTH_REQUIRED=false."""
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "true")
+        monkeypatch.setenv("REDIS_AUTH_REQUIRED", "false")
+        monkeypatch.delenv("REDIS_PASSWORD", raising=False)
+        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+        validate_auth_configuration()  # Must not raise
+
+    def test_development_permits_redis_auth_mode_none(self, monkeypatch):
+        """Development explicitly permits REDIS_AUTH_MODE=none."""
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("REQUIRE_AUTH", "false")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "true")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "none")
+        monkeypatch.delenv("REDIS_PASSWORD", raising=False)
+        validate_auth_configuration()  # Must not raise
+
+    def test_production_rejects_redis_auth_mode_none(self, monkeypatch):
+        """Production strictly prohibits REDIS_AUTH_MODE=none."""
         monkeypatch.setenv("ENVIRONMENT", "production")
         monkeypatch.setenv("REQUIRE_AUTH", "true")
         monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
         monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
         monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
         monkeypatch.setenv("PROTECT_METRICS", "true")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "none")
 
-        # Architectural exception 1: REDIS_AUTH_MODE=mtls
-        monkeypatch.setenv("REDIS_AUTH_MODE", "mtls")
-        validate_auth_configuration()
+        with pytest.raises(ValueError, match="REDIS_AUTH_MODE=none .* is strictly prohibited in production"):
+            validate_auth_configuration()
 
-        # Architectural exception 2: REDIS_AUTH_MODE=iam
+    def test_iam_mode_strictly_rejected(self, monkeypatch):
+        """REDIS_AUTH_MODE=iam is rejected with NotImplementedError because no IAM provider is implemented."""
         monkeypatch.setenv("REDIS_AUTH_MODE", "iam")
-        validate_auth_configuration()
+        with pytest.raises(NotImplementedError, match="Redis authentication mode 'iam' is not implemented"):
+            validate_auth_configuration()
 
-        # Architectural exception 3: REDIS_AUTH_MODE=network_isolated
+    def test_unknown_redis_auth_mode_rejected(self, monkeypatch):
+        """Unrecognized REDIS_AUTH_MODE values are rejected with ValueError."""
+        monkeypatch.setenv("REDIS_AUTH_MODE", "unsupported_protocol_xyz")
+        with pytest.raises(ValueError, match="Unknown or unsupported REDIS_AUTH_MODE"):
+            validate_auth_configuration()
+
+    def test_mtls_missing_tls_scheme_rejected(self, monkeypatch):
+        """REDIS_AUTH_MODE=mtls requires a TLS connection (rediss:// or REDIS_SSL=true)."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
+        monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("PROTECT_METRICS", "true")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "mtls")
+        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")  # Plain redis://
+
+        with pytest.raises(ValueError, match="REDIS_AUTH_MODE=mtls requires a TLS-enabled Redis connection"):
+            validate_auth_configuration()
+
+    def test_mtls_missing_cert_file_rejected(self, monkeypatch):
+        """REDIS_AUTH_MODE=mtls requires real certificate files on disk."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
+        monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("PROTECT_METRICS", "true")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "mtls")
+        monkeypatch.setenv("REDIS_URL", "rediss://redis.internal:6379/0")
+        monkeypatch.setenv("REDIS_SSL_CERTFILE", "/non/existent/cert.crt")
+
+        with pytest.raises(ValueError, match="REDIS_SSL_CERTFILE is missing or file does not exist"):
+            validate_auth_configuration()
+
+    def test_mtls_valid_certificates_accepted(self, monkeypatch):
+        """REDIS_AUTH_MODE=mtls succeeds when TLS scheme and valid cert files exist."""
+        with tempfile.NamedTemporaryFile() as cert, tempfile.NamedTemporaryFile() as key, tempfile.NamedTemporaryFile() as ca:
+            monkeypatch.setenv("ENVIRONMENT", "production")
+            monkeypatch.setenv("REQUIRE_AUTH", "true")
+            monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
+            monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
+            monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+            monkeypatch.setenv("PROTECT_METRICS", "true")
+            monkeypatch.setenv("REDIS_AUTH_MODE", "mtls")
+            monkeypatch.setenv("REDIS_URL", "rediss://redis.internal:6379/0")
+            monkeypatch.setenv("REDIS_SSL_CERTFILE", cert.name)
+            monkeypatch.setenv("REDIS_SSL_KEYFILE", key.name)
+            monkeypatch.setenv("REDIS_SSL_CA_CERTS", ca.name)
+
+            validate_auth_configuration()  # Must succeed!
+
+    def test_network_isolated_requires_explicit_operator_attestation(self, monkeypatch):
+        """REDIS_AUTH_MODE=network_isolated requires explicit operator attestation in production."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("REQUIRE_AUTH", "true")
+        monkeypatch.setenv("AUTH_SECRET_KEY", "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e")
+        monkeypatch.setenv("ADMIN_API_KEY", "prod-admin-secret-at-least-32-chars-long-12345")
+        monkeypatch.setenv("ALLOW_UNAUTHENTICATED_DEV_HEADERS", "false")
+        monkeypatch.setenv("PROTECT_METRICS", "true")
         monkeypatch.setenv("REDIS_AUTH_MODE", "network_isolated")
+        monkeypatch.delenv("ATTEST_NETWORK_ISOLATED_REDIS", raising=False)
+        monkeypatch.delenv("ALLOW_NETWORK_ISOLATED_REDIS", raising=False)
+
+        # 1. Unattested: strictly rejected
+        with pytest.raises(ValueError, match="operator-attested network security boundary"):
+            validate_auth_configuration()
+
+        # 2. Operator attested: accepted
+        monkeypatch.setenv("ATTEST_NETWORK_ISOLATED_REDIS", "true")
         validate_auth_configuration()
 
-        # Architectural exception 4: REDIS_AUTH_REQUIRED=false
-        monkeypatch.delenv("REDIS_AUTH_MODE", raising=False)
-        monkeypatch.setenv("REDIS_AUTH_REQUIRED", "false")
-        validate_auth_configuration()
+
+# =============================================================================
+# 6. Redis Startup Connectivity & PING Verification
+# =============================================================================
+
+class TestRedisStartupConnectivityCheck:
+    """Verifies bounded-time Redis connectivity & auth PING during startup."""
+
+    def test_startup_ping_succeeds_with_correct_credentials(self, live_protected_redis):
+        """Startup PING succeeds when correct Redis credentials are provided."""
+        secret = live_protected_redis
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password=secret,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        assert limiter.verify_connection(timeout=1.0) is True
+
+    def test_startup_ping_fails_closed_on_missing_password(self, live_protected_redis):
+        """Startup PING fails closed with RedisUnavailableError when password is required but missing."""
+        secret = live_protected_redis
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password=None,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        with pytest.raises(RedisUnavailableError) as exc_info:
+            limiter.verify_connection(timeout=1.0)
+        err = str(exc_info.value)
+        assert "startup connectivity check failed" in err
+        assert secret not in err
+
+    def test_startup_ping_fails_closed_on_incorrect_password(self, live_protected_redis):
+        """Startup PING fails closed with RedisUnavailableError when password is incorrect."""
+        secret = live_protected_redis
+        wrong_pwd = "wrong_test_pass_12345"
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6379",
+            redis_password=wrong_pwd,
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        with pytest.raises(RedisUnavailableError) as exc_info:
+            limiter.verify_connection(timeout=1.0)
+        err = str(exc_info.value)
+        assert "startup connectivity check failed" in err
+        assert wrong_pwd not in err
+        assert secret not in err
+
+    def test_startup_ping_fails_closed_on_unavailable_redis(self):
+        """Startup PING fails closed with RedisUnavailableError when Redis is completely down/unreachable."""
+        limiter = RateLimiter(
+            redis_url="redis://localhost:6399",  # unreachable port
+            redis_password="some_password_12345",
+            failure_mode=FailureMode.FAIL_CLOSED
+        )
+        with pytest.raises(RedisUnavailableError) as exc_info:
+            limiter.verify_connection(timeout=0.5)
+        err = str(exc_info.value)
+        assert "startup connectivity check failed" in err
+
+    def test_startup_ping_graceful_under_fail_open_and_local_fallback(self):
+        """Startup PING returns False without raising when failure mode is FAIL_OPEN or LOCAL_FALLBACK."""
+        limiter_open = RateLimiter(
+            redis_url="redis://localhost:6399",
+            redis_password="some_password_12345",
+            failure_mode=FailureMode.FAIL_OPEN
+        )
+        assert limiter_open.verify_connection(timeout=0.5) is False
+
+        limiter_fallback = RateLimiter(
+            redis_url="redis://localhost:6399",
+            redis_password="some_password_12345",
+            failure_mode=FailureMode.LOCAL_FALLBACK
+        )
+        assert limiter_fallback.verify_connection(timeout=0.5) is False
 
 
 # =============================================================================

@@ -339,71 +339,114 @@ def validate_metrics_configuration() -> None:
                 )
 
 
+SUPPORTED_REDIS_AUTH_MODES = {"password", "mtls", "network_isolated", "none"}
+
+
 def get_redis_auth_mode() -> str:
     """
     Returns the configured Redis authentication mode.
     Supported modes:
-      - 'password': Password-based authentication via REDIS_PASSWORD or REDIS_URL credentials (default when credentials are configured).
-      - 'mtls': Mutual TLS / client certificate authentication (architectural exception).
-      - 'iam': Cloud IAM / instance metadata authentication (architectural exception).
-      - 'network_isolated': Private network / VPC / service-mesh isolated without application-layer password (architectural exception).
-      - 'none': Explicit unauthenticated Redis (prohibited in production unless REDIS_AUTH_REQUIRED=false).
+      - 'password': Password-based authentication via REDIS_PASSWORD or REDIS_URL credentials (default).
+      - 'mtls': Mutual TLS / client certificate authentication (requires verified TLS + certs).
+      - 'network_isolated': Operator-attested network security boundary (requires ATTEST_NETWORK_ISOLATED_REDIS=true).
+      - 'none': Explicit unauthenticated Redis (prohibited in production).
+
+    Rejection rules:
+      - 'iam' raises NotImplementedError: No supported IAM credential provider is implemented.
+      - Any unrecognized mode raises ValueError.
     """
     mode = os.getenv("REDIS_AUTH_MODE", "").strip().lower()
-    if mode:
-        return mode
-    if os.getenv("REDIS_PASSWORD", "").strip():
+    if not mode:
         return "password"
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-    parsed = urllib.parse.urlsplit(redis_url)
-    if parsed.password:
-        return "password"
-    return "none"
+
+    if mode == "iam":
+        raise NotImplementedError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: Redis authentication mode 'iam' is not implemented in this application. "
+            "Do not configure REDIS_AUTH_MODE=iam without a real supported IAM credential provider."
+        )
+
+    if mode not in SUPPORTED_REDIS_AUTH_MODES:
+        raise ValueError(
+            f"CRITICAL SECURITY CONFIGURATION ERROR: Unknown or unsupported REDIS_AUTH_MODE: {mode!r}. "
+            f"Supported modes are: {', '.join(sorted(SUPPORTED_REDIS_AUTH_MODES))}."
+        )
+
+    return mode
 
 
 def is_redis_auth_required() -> bool:
     """
     Returns True if Redis authentication is required for this deployment.
     Accepts REDIS_AUTH_REQUIRED or REQUIRE_REDIS_AUTH environment variables.
+
+    Production Rules:
+      - Mandatory by default in production (returns True).
+      - If REDIS_AUTH_REQUIRED is explicitly set to 'false' in production, it is strictly rejected (ValueError)
+        unless an operator-attested alternative security boundary is configured (e.g. REDIS_AUTH_MODE=network_isolated).
+
+    Development / Test Rules:
+      - Defaults to False unless explicitly configured with REDIS_AUTH_REQUIRED=true.
     """
+    is_prod = is_production_env()
     val = os.getenv("REDIS_AUTH_REQUIRED")
     if val is None:
         val = os.getenv("REQUIRE_REDIS_AUTH")
+
     if val is not None and val.strip() != "":
         var_name = "REDIS_AUTH_REQUIRED" if os.getenv("REDIS_AUTH_REQUIRED") is not None else "REQUIRE_REDIS_AUTH"
-        return parse_bool_env(var_name, default=False)
-    # If auth mode is explicitly configured as 'password', auth is required
-    mode = os.getenv("REDIS_AUTH_MODE", "").strip().lower()
-    if mode == "password":
-        return True
-    return False
+        parsed = parse_bool_env(var_name, default=is_prod)
+        if is_prod and not parsed:
+            raise ValueError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: Insecure production configuration: "
+                f"{var_name} cannot be set to false in a production environment. "
+                "Redis authentication is mandatory by default in production. "
+                "For private network isolation without application passwords, configure "
+                "REDIS_AUTH_MODE=network_isolated with explicit ATTEST_NETWORK_ISOLATED_REDIS=true."
+            )
+        return parsed
+
+    # Default: True in production, False in development/test
+    return is_prod
 
 
 def validate_redis_configuration() -> None:
     """
     Validates Redis authentication and security configuration during application startup.
-    
+
     Security Rules:
-      1. Contradiction Detection: Rejects contradictory credentials (REDIS_PASSWORD != password in REDIS_URL).
-      2. Insecure Secrets / Placeholders: Rejects known example or weak passwords.
-      3. Production Validation:
-         - When production uses password-protected Redis (REDIS_AUTH_REQUIRED=true or REDIS_AUTH_MODE=password):
-           rejects missing Redis credentials.
-         - Minimum length check on configured passwords in production (at least 16 chars).
-         - Respects architectural exceptions:
-           * REDIS_AUTH_REQUIRED=false or REQUIRE_REDIS_AUTH=false
-           * REDIS_AUTH_MODE in ('mtls', 'iam', 'network_isolated')
-      4. Secrets are NEVER logged or printed in exceptions/errors.
+      1. Mandatory in Production:
+         - Production requires Redis authentication by default (REDIS_AUTH_REQUIRED=true).
+         - Rejects missing Redis credentials when auth_mode is 'password'.
+      2. Normalization & Contradiction Detection:
+         - Percent-encoded URL credentials are normalized (unquoted) before comparing with REDIS_PASSWORD.
+         - Embedded username and password in REDIS_URL are preserved.
+         - Rejects contradictory credentials (normalized REDIS_PASSWORD != normalized password in REDIS_URL).
+      3. Alternative Authentication Modes:
+         - 'mtls': Requires an actual TLS connection (rediss:// or REDIS_SSL=true) AND valid client
+           certificates (REDIS_SSL_CERTFILE, REDIS_SSL_KEYFILE, REDIS_SSL_CA_CERTS) that exist on disk.
+         - 'iam': Strictly rejected with NotImplementedError (no IAM credential provider implemented).
+         - 'network_isolated': Documented as an operator-attested network security boundary, not application-level
+           authentication. In production, requires explicit ATTEST_NETWORK_ISOLATED_REDIS=true.
+         - 'none': Prohibited in production. Allowed in development/test only.
+         - Unknown modes: Rejected with ValueError.
+      4. Secrets are NEVER logged or printed in error messages.
     """
     is_prod = is_production_env()
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
     parsed = urllib.parse.urlsplit(redis_url)
-    url_password = parsed.password
-    env_password = os.getenv("REDIS_PASSWORD", "").strip() or None
 
-    # 1. Contradiction check: URL password vs REDIS_PASSWORD
-    if url_password and env_password:
-        if url_password != env_password:
+    # Normalize percent-encoded credentials from URL
+    url_password_raw = parsed.password
+    url_password = urllib.parse.unquote(url_password_raw) if url_password_raw is not None else None
+
+    # Environment password
+    env_password_raw = os.getenv("REDIS_PASSWORD")
+    env_password = env_password_raw if (env_password_raw is not None and env_password_raw != "") else None
+
+    # Contradiction check: compare normalized strings
+    if url_password is not None and env_password is not None:
+        norm_env = urllib.parse.unquote(env_password)
+        if url_password != env_password and url_password != norm_env:
             raise ValueError(
                 "CRITICAL SECURITY CONFIGURATION ERROR: Contradictory Redis credentials detected. "
                 "The password provided in REDIS_URL does not match REDIS_PASSWORD."
@@ -412,6 +455,62 @@ def validate_redis_configuration() -> None:
     effective_password = env_password or url_password
     auth_mode = get_redis_auth_mode()
     redis_auth_required = is_redis_auth_required()
+
+    # 1. Alternative authentication mode validation
+    if auth_mode == "none":
+        if is_prod:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: Insecure production configuration: "
+                "REDIS_AUTH_MODE=none (unauthenticated Redis) is strictly prohibited in production."
+            )
+
+    elif auth_mode == "mtls":
+        is_tls = redis_url.startswith("rediss://") or parse_bool_env("REDIS_SSL", False)
+        if not is_tls:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: REDIS_AUTH_MODE=mtls requires a TLS-enabled Redis connection. "
+                "REDIS_URL must use the 'rediss://' scheme or REDIS_SSL=true must be configured."
+            )
+        certfile = os.getenv("REDIS_SSL_CERTFILE", "").strip()
+        keyfile = os.getenv("REDIS_SSL_KEYFILE", "").strip()
+        ca_certs = os.getenv("REDIS_SSL_CA_CERTS", "").strip()
+
+        if not certfile or not os.path.isfile(certfile):
+            raise ValueError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: REDIS_AUTH_MODE=mtls requires a valid client certificate file, "
+                f"but REDIS_SSL_CERTFILE is missing or file does not exist: {certfile!r}."
+            )
+        if not keyfile or not os.path.isfile(keyfile):
+            raise ValueError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: REDIS_AUTH_MODE=mtls requires a valid client private key file, "
+                f"but REDIS_SSL_KEYFILE is missing or file does not exist: {keyfile!r}."
+            )
+        if not ca_certs or not os.path.isfile(ca_certs):
+            raise ValueError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: REDIS_AUTH_MODE=mtls requires a valid CA certificate file, "
+                f"but REDIS_SSL_CA_CERTS is missing or file does not exist: {ca_certs!r}."
+            )
+
+    elif auth_mode == "network_isolated":
+        if is_prod:
+            attested = parse_bool_env("ATTEST_NETWORK_ISOLATED_REDIS", False) or parse_bool_env("ALLOW_NETWORK_ISOLATED_REDIS", False)
+            if not attested:
+                raise ValueError(
+                    "CRITICAL SECURITY CONFIGURATION ERROR: REDIS_AUTH_MODE=network_isolated is an operator-attested "
+                    "network security boundary, not application-level authentication. "
+                    "In production, this configuration requires explicit operator attestation via "
+                    "ATTEST_NETWORK_ISOLATED_REDIS=true, acknowledging that Redis is protected exclusively by "
+                    "private network / VPC / service-mesh boundary isolation."
+                )
+
+    elif auth_mode == "password":
+        if is_prod and redis_auth_required and not effective_password:
+            raise RuntimeError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: Redis authentication is mandatory in production by default. "
+                "No Redis credentials were provided. Supply REDIS_PASSWORD or embed credentials in REDIS_URL. "
+                "For verified network-isolated deployments, configure REDIS_AUTH_MODE=network_isolated with "
+                "ATTEST_NETWORK_ISOLATED_REDIS=true."
+            )
 
     # 2. Known placeholder & weak password rejection
     KNOWN_REDIS_PLACEHOLDERS = KNOWN_INSECURE_SECRETS.union({
@@ -428,21 +527,6 @@ def validate_redis_configuration() -> None:
                 f"CRITICAL SECURITY CONFIGURATION ERROR: Redis password has insufficient length "
                 f"({len(effective_password)} characters). Minimum recommended length in production is 16 characters."
             )
-
-    # 3. Production enforcement
-    if is_prod:
-        is_architectural_exception = auth_mode in ("mtls", "iam", "network_isolated")
-        req_auth_env = os.getenv("REDIS_AUTH_REQUIRED") or os.getenv("REQUIRE_REDIS_AUTH")
-        if req_auth_env is not None and not redis_auth_required:
-            is_architectural_exception = True
-
-        if not is_architectural_exception:
-            if redis_auth_required and not effective_password:
-                raise RuntimeError(
-                    "CRITICAL SECURITY CONFIGURATION ERROR: Redis authentication is required in production, "
-                    "but no Redis credentials were provided. Supply REDIS_PASSWORD, embed credentials in REDIS_URL, "
-                    "or configure an architectural exception (REDIS_AUTH_REQUIRED=false or REDIS_AUTH_MODE=mtls/iam/network_isolated)."
-                )
 
 
 @dataclass

@@ -332,11 +332,23 @@ class RateLimiter:
         self.redis_url = redis_url
 
         # Redis password configuration: explicitly passed or from environment
+        parsed = urllib.parse.urlsplit(self.redis_url)
+        url_pwd_raw = parsed.password
+        url_pwd = urllib.parse.unquote(url_pwd_raw) if url_pwd_raw is not None else None
+
         if redis_password is not None:
-            self.redis_password = redis_password.strip() if redis_password.strip() else None
+            self.redis_password = redis_password if redis_password != "" else None
         else:
-            env_pwd = os.getenv("REDIS_PASSWORD", "").strip()
-            self.redis_password = env_pwd if env_pwd else None
+            env_pwd = os.getenv("REDIS_PASSWORD")
+            self.redis_password = env_pwd if (env_pwd is not None and env_pwd != "") else (url_pwd if url_pwd is not None else None)
+
+        # Contradiction check with percent-encoded normalization
+        if url_pwd is not None and self.redis_password is not None:
+            norm_env = urllib.parse.unquote(self.redis_password)
+            if url_pwd != self.redis_password and url_pwd != norm_env:
+                raise ValueError(
+                    "Contradictory Redis credentials: REDIS_PASSWORD does not match the password supplied in REDIS_URL."
+                )
 
         # Backwards compatibility for legacy `enable_fallback` parameter
         if enable_fallback is not None:
@@ -420,16 +432,19 @@ class RateLimiter:
 
         new_redis_password = None
         if redis_password is not None:
-            new_redis_password = redis_password.strip() if redis_password.strip() else None
+            new_redis_password = redis_password if redis_password != "" else None
 
-        # Verify credential consistency between URL and password parameter
+        # Verify credential consistency between URL and password parameter (with percent-encoding normalization)
         target_url = new_redis_url if new_redis_url is not None else self.redis_url
         target_pwd = new_redis_password if redis_password is not None else self.redis_password
         parsed = urllib.parse.urlsplit(target_url)
-        if parsed.password and target_pwd and parsed.password != target_pwd:
-            raise ValueError(
-                "Contradictory Redis credentials: REDIS_PASSWORD does not match the password supplied in REDIS_URL."
-            )
+        url_pwd = urllib.parse.unquote(parsed.password) if parsed.password is not None else None
+        if url_pwd is not None and target_pwd is not None:
+            norm_target = urllib.parse.unquote(target_pwd)
+            if url_pwd != target_pwd and url_pwd != norm_target:
+                raise ValueError(
+                    "Contradictory Redis credentials: REDIS_PASSWORD does not match the password supplied in REDIS_URL."
+                )
 
         reconnect_redis = (
             (new_redis_url is not None and new_redis_url != self.redis_url) or
@@ -458,15 +473,18 @@ class RateLimiter:
         try:
             kwargs = {
                 "decode_responses": True,
-                "socket_connect_timeout": 0.5,
-                "socket_timeout": 0.5,
+                "socket_connect_timeout": 1.0,
+                "socket_timeout": 1.0,
             }
             parsed = urllib.parse.urlsplit(self.redis_url)
+            url_pwd = urllib.parse.unquote(parsed.password) if parsed.password is not None else None
             if parsed.password:
-                if self.redis_password and self.redis_password != parsed.password:
-                    raise ValueError(
-                        "Contradictory Redis credentials: REDIS_PASSWORD does not match the password supplied in REDIS_URL."
-                    )
+                if self.redis_password:
+                    norm_env = urllib.parse.unquote(self.redis_password)
+                    if url_pwd != self.redis_password and url_pwd != norm_env:
+                        raise ValueError(
+                            "Contradictory Redis credentials: REDIS_PASSWORD does not match the password supplied in REDIS_URL."
+                        )
             elif self.redis_password:
                 kwargs["password"] = self.redis_password
 
@@ -476,6 +494,34 @@ class RateLimiter:
             raise
         except Exception:
             self.check_limit_script = None
+            if self.failure_mode == FailureMode.FAIL_CLOSED:
+                # Do not suppress if strictly failing closed on startup
+                pass
+
+    def verify_connection(self, timeout: float = 1.0) -> bool:
+        """
+        Validates Redis reachability and authentication during application startup
+        using a bounded-time PING command.
+
+        Under FAIL_CLOSED:
+          - Raises RedisUnavailableError (with sanitized error messages) if Redis is
+            unreachable, down, or authentication fails.
+        Under FAIL_OPEN / LOCAL_FALLBACK:
+          - Returns False if unreachable or auth fails, permitting graceful degradation.
+        """
+        if not self.redis:
+            if self.failure_mode == FailureMode.FAIL_CLOSED:
+                raise RedisUnavailableError("Rate limiter service unavailable (Redis client not configured)")
+            return False
+        try:
+            return bool(self.redis.ping())
+        except (redis.RedisError, TimeoutError, OSError) as e:
+            clean_err = sanitize_redis_error_message(e)
+            if self.failure_mode == FailureMode.FAIL_CLOSED:
+                raise RedisUnavailableError(
+                    f"Rate limiter startup connectivity check failed (Redis unreachable or authentication failed: {clean_err})"
+                ) from e
+            return False
             if self.failure_mode == FailureMode.FAIL_CLOSED:
                 # Do not suppress if strictly failing closed on startup
                 pass
