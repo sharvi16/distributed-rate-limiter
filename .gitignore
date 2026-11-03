@@ -1,4 +1,25 @@
-.venv/
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment Variables & Local Config
 .env
+.env.*
+!.env.example
+
+# Logs & Databases
+*.log
+*.rdb
+
+# Editor & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
