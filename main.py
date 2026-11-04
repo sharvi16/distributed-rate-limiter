@@ -547,10 +547,10 @@ def limited_resource(
         )
 
     if classification == "suspicious":
-        metrics_collector.inc_challenge_issued()
-        metrics_collector.inc_request("challenge_required")
         challenge = detector.generate_challenge(user_id, features)
         if challenge.get("jailed"):
+            metrics_collector.inc_jailed()
+            metrics_collector.inc_request("jailed")
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail={
@@ -560,6 +560,9 @@ def limited_resource(
                 },
                 headers={"Retry-After": str(challenge.get("retry_after", 300))}
             )
+
+        metrics_collector.inc_challenge_issued()
+        metrics_collector.inc_request("challenge_required")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={

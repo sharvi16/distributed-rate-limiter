@@ -672,7 +672,29 @@ class RateLimiter:
                 res = conn.read_response()
                 return bool(str(res).upper() in ("PONG", "TRUE", "OK", "1") or res is True)
             else:
-                return bool(self.redis.ping())
+                # Client does not expose a standard connection pool (e.g. mock or custom wrapper).
+                # Execute bounded ping using a daemon worker with join(timeout) to never hang indefinitely.
+                result_box = []
+                err_box = []
+
+                def _do_ping():
+                    try:
+                        result_box.append(self.redis.ping())
+                    except Exception as err:
+                        err_box.append(err)
+
+                worker = threading.Thread(target=_do_ping, daemon=True)
+                worker.start()
+                worker.join(timeout=timeout_val)
+
+                if worker.is_alive():
+                    raise TimeoutError(f"Redis connectivity check timed out after {timeout_val}s")
+                if err_box:
+                    raise err_box[0]
+                if result_box:
+                    res = result_box[0]
+                    return bool(str(res).upper() in ("PONG", "TRUE", "OK", "1") or res is True)
+                return False
         except (redis.TimeoutError, TimeoutError, socket.timeout) as e:
             clean_err = f"Redis connectivity check timed out after {timeout_val}s"
             if self.failure_mode == FailureMode.FAIL_CLOSED:
@@ -745,9 +767,23 @@ class RateLimiter:
                     args=[snapshot.capacity, snapshot.refill_rate, tokens]
                 )
                 try:
-                    allowed = bool(result[0] == 1)
-                    remaining = max(0.0, float(result[1]))
-                except (TypeError, IndexError) as parse_err:
+                    if not isinstance(result, (list, tuple)) or len(result) < 2:
+                        raise ValueError(f"Malformed Lua response: expected sequence of at least 2 elements, got {result!r}")
+
+                    raw_allowed = result[0]
+                    if raw_allowed not in (0, 1):
+                        raise ValueError(f"Malformed Lua response: invalid allowed indicator {raw_allowed!r}")
+                    allowed = bool(raw_allowed == 1)
+
+                    raw_remaining = result[1]
+                    if isinstance(raw_remaining, bool):
+                        raise TypeError(f"Malformed Lua response: boolean remaining tokens {raw_remaining!r}")
+
+                    remaining_float = float(raw_remaining)
+                    if math.isnan(remaining_float) or math.isinf(remaining_float) or remaining_float < 0:
+                        raise ValueError(f"Malformed Lua response: invalid remaining tokens value {remaining_float!r}")
+                    remaining = remaining_float
+                except (TypeError, IndexError, ValueError) as parse_err:
                     return self._handle_check_limit_failure(user_id, tokens, parse_err, snapshot=snapshot)
 
                 reset_after = max(0.0, (snapshot.capacity - remaining) / snapshot.refill_rate)

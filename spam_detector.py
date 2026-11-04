@@ -972,7 +972,9 @@ class AdaptiveSpamDetector:
         """
         now = time.time()
         with self._lock:
-            active_local = sum(1 for exp in self._local_penalty_box.values() if exp > now)
+            local_active_targets = {
+                uid for uid, exp in self._local_penalty_box.items() if exp > now
+            }
             metrics_dict = dict(self.stats)
             centroids = {
                 "human": {
@@ -990,23 +992,24 @@ class AdaptiveSpamDetector:
                 "total_self_learning_updates": self.model_state["total_updates"]
             }
 
-        redis_jailed_count = 0
+        redis_jailed_targets = set()
         redis_active = False
         if self.redis:
             try:
-                count = 0
-                for _ in self.redis.scan_iter("penalty_box:*"):
-                    count += 1
-                redis_jailed_count = count
+                for raw_key in self.redis.scan_iter("penalty_box:*"):
+                    k = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
+                    target = k[12:] if k.startswith("penalty_box:") else k
+                    redis_jailed_targets.add(target)
                 redis_active = True
             except Exception:
                 redis_active = False
 
         if redis_active:
-            total_jailed = redis_jailed_count + active_local
-            note = "Aggregated count from Redis cluster (penalty_box:*) and local in-memory fallback state."
+            all_jailed = redis_jailed_targets | local_active_targets
+            total_jailed = len(all_jailed)
+            note = "Deduplicated active jailed identity count aggregated from Redis cluster (penalty_box:*) and local in-memory fallback state."
         else:
-            total_jailed = active_local
+            total_jailed = len(local_active_targets)
             note = "Count reflects local in-memory fallback state only (Redis unavailable or not connected)."
 
         return {

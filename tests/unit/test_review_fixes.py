@@ -1,7 +1,8 @@
 """
-Unit and regression tests verifying all 10 fixes for the code review follow-up.
+Unit and regression tests verifying all fixes for the code review follow-up.
 """
 
+import math
 import time
 import uuid
 import pytest
@@ -145,43 +146,51 @@ def test_challenge_generation_per_user_throttle_redis():
 
 
 # =============================================================================
-# Issue 6: rate_limiter.py — Type guard on Redis Lua script result in check_limit
+# Issue 6 & Priority 2: Strengthened Lua result validation in check_limit
 # =============================================================================
 
-def test_check_limit_handles_unexpected_lua_result():
-    """check_limit routes unexpected result types from Lua (None, empty list, etc.) to failure handler."""
-    limiter = RateLimiter(
-        capacity=10,
-        refill_rate=1.0,
-        failure_mode=FailureMode.LOCAL_FALLBACK
-    )
-    mock_redis = MagicMock()
-    limiter.redis = mock_redis
+@pytest.mark.parametrize("bad_result", [
+    None,
+    [],
+    [1],
+    [1, "invalid"],
+    [1, None],
+    [1, True],
+    [1, float("nan")],
+    [1, float("inf")],
+    [1, -5.0],
+    ["invalid", 5.0],
+    123,
+    {"allowed": 1, "remaining": 5}
+])
+def test_check_limit_handles_all_malformed_lua_responses(bad_result):
+    """check_limit routes any malformed Lua response to failure handler across all 3 failure modes."""
+    # 1. LOCAL_FALLBACK: falls back to local in-memory token bucket gracefully
+    lim_fallback = RateLimiter(capacity=10, refill_rate=1.0, failure_mode=FailureMode.LOCAL_FALLBACK)
+    lim_fallback.redis = MagicMock()
+    lim_fallback.check_limit_script = MagicMock(return_value=bad_result)
+    res_fallback = lim_fallback.check_limit("user_fb_bad")
+    assert res_fallback.allowed is True
 
-    # Case A: Lua script returns None
-    limiter.check_limit_script = MagicMock(return_value=None)
-    result = limiter.check_limit("user_test_none")
-    assert result.allowed is True  # handled via local fallback
+    # 2. FAIL_OPEN: allows gracefully
+    lim_open = RateLimiter(capacity=10, refill_rate=1.0, failure_mode=FailureMode.FAIL_OPEN)
+    lim_open.redis = MagicMock()
+    lim_open.check_limit_script = MagicMock(return_value=bad_result)
+    res_open = lim_open.check_limit("user_fo_bad")
+    assert res_open.allowed is True
+    assert res_open.remaining == 10.0
 
-    # Case B: Lua script returns empty list []
-    limiter.check_limit_script = MagicMock(return_value=[])
-    result = limiter.check_limit("user_test_empty")
-    assert result.allowed is True
-
-    # Case C: Under FAIL_CLOSED, unexpected return routes to RedisUnavailableError
-    limiter_closed = RateLimiter(
-        capacity=10,
-        refill_rate=1.0,
-        failure_mode=FailureMode.FAIL_CLOSED
-    )
-    limiter_closed.redis = mock_redis
-    limiter_closed.check_limit_script = MagicMock(return_value=None)
-    with pytest.raises(RedisUnavailableError):
-        limiter_closed.check_limit("user_test_closed")
+    # 3. FAIL_CLOSED: raises RedisUnavailableError
+    lim_closed = RateLimiter(capacity=10, refill_rate=1.0, failure_mode=FailureMode.FAIL_CLOSED)
+    lim_closed.redis = MagicMock()
+    lim_closed.check_limit_script = MagicMock(return_value=bad_result)
+    with pytest.raises(RedisUnavailableError) as exc_info:
+        lim_closed.check_limit("user_fc_bad")
+    assert "Rate limiter service unavailable" in str(exc_info.value)
 
 
 # =============================================================================
-# Issue 7: spam_detector.py — active_jailed_users in get_diagnostics()
+# Issue 7 & Priority 1: Accurate diagnostics without double-counting
 # =============================================================================
 
 def test_get_diagnostics_active_jailed_users_local():
@@ -196,23 +205,43 @@ def test_get_diagnostics_active_jailed_users_local():
     assert "local in-memory" in diag["active_jailed_users_note"]
 
 
-def test_get_diagnostics_active_jailed_users_redis_aggregation():
-    """get_diagnostics() aggregates Redis SCAN keys with local state."""
+def test_get_diagnostics_no_double_counting_between_redis_and_local():
+    """When the same user exists in both Redis and local penalty box, they must NOT be double-counted."""
     mock_redis = MagicMock()
-    mock_redis.scan_iter.return_value = ["penalty_box:u1", "penalty_box:u2", "penalty_box:u3"]
+    # Redis holds user 'alice' and user 'bob'
+    mock_redis.scan_iter.return_value = ["penalty_box:alice", "penalty_box:bob"]
 
     det = AdaptiveSpamDetector(redis_client=mock_redis)
+    now = time.time()
     with det._lock:
-        det._local_penalty_box["local_u1"] = time.time() + 60
+        # Local state mirrors 'alice' (from jail_user) and has a distinct local-only user 'charlie'
+        det._local_penalty_box["alice"] = now + 60
+        det._local_penalty_box["charlie"] = now + 60
 
     diag = det.get_diagnostics()
-    assert diag["active_jailed_users"] == 4  # 3 from Redis + 1 local
+    # Total distinct jailed users: alice, bob, charlie = exactly 3 (NOT 2+2=4)
+    assert diag["active_jailed_users"] == 3
     assert "active_jailed_users_note" in diag
-    assert "Redis cluster" in diag["active_jailed_users_note"]
+    assert "Deduplicated" in diag["active_jailed_users_note"]
+
+
+def test_get_diagnostics_falls_back_to_local_when_redis_scan_fails():
+    """When Redis scan raises an exception, get_diagnostics safely reports local-only count."""
+    mock_redis = MagicMock()
+    mock_redis.scan_iter.side_effect = Exception("Redis scan network error")
+
+    det = AdaptiveSpamDetector(redis_client=mock_redis)
+    now = time.time()
+    with det._lock:
+        det._local_penalty_box["local_user_only"] = now + 60
+
+    diag = det.get_diagnostics()
+    assert diag["active_jailed_users"] == 1
+    assert "local in-memory" in diag["active_jailed_users_note"]
 
 
 # =============================================================================
-# Issue 8: main.py — Metrics increment on successful challenge verification
+# Issue 8 & Priority 3: Metric counters for challenge issued and verified
 # =============================================================================
 
 def test_verify_challenge_increments_metrics():
@@ -246,6 +275,71 @@ def test_verify_challenge_increments_metrics():
         det.redis = old_redis
 
 
+def test_throttled_challenge_does_not_increment_issued_counter(monkeypatch):
+    """A throttled challenge request must jail user and NOT increment challenges_issued_total."""
+    from fastapi.testclient import TestClient
+
+    # Ensure rate limiters use local fallback so request reaches Tier 4 (spam detector)
+    mock_user_limiter = RateLimiter(redis_client=None, capacity=10, refill_rate=1.0, failure_mode=FailureMode.LOCAL_FALLBACK)
+    mock_ip_limiter = RateLimiter(redis_client=None, capacity=30, refill_rate=1.0, failure_mode=FailureMode.LOCAL_FALLBACK)
+    monkeypatch.setattr(main, "limiter", mock_user_limiter)
+    monkeypatch.setattr(main, "ip_limiter", mock_ip_limiter)
+
+    client = TestClient(main.app)
+
+    user_id = f"test_throttle_metrics_{uuid.uuid4().hex[:8]}"
+    features = {"interval_std": 0.05, "burst_count": 3.0, "mean_interval": 0.2, "ua_suspicion": 0.5}
+
+    det = main.detector
+    # Fill up 3 allowed challenge requests
+    det.generate_challenge(user_id, features)
+    det.generate_challenge(user_id, features)
+    det.generate_challenge(user_id, features)
+
+    # Clear pending challenge so request passes Tier 2 and reaches Tier 4 (ML classifier)
+    with det._lock:
+        det._local_challenges.clear()
+    if det.redis:
+        try:
+            det.redis.delete(f"user_pending_challenge:{user_id}")
+        except Exception:
+            pass
+
+    initial_issued = metrics_collector.challenges_issued_total
+
+    # Mock classifier to return "suspicious" to trigger the challenge route
+    with patch.object(det, "compute_risk_score", return_value=(0.6, "suspicious")):
+        response = client.get("/limited-resource", headers={"user-id": user_id})
+        assert response.status_code == 429
+        assert "Challenge generation limit exceeded" in response.json()["detail"]["message"]
+
+    # Must NOT have incremented challenges_issued_total
+    assert metrics_collector.challenges_issued_total == initial_issued
+
+
+def test_successful_challenge_increments_issued_counter(monkeypatch):
+    """A successfully issued challenge must increment challenges_issued_total."""
+    from fastapi.testclient import TestClient
+
+    mock_user_limiter = RateLimiter(redis_client=None, capacity=10, refill_rate=1.0, failure_mode=FailureMode.LOCAL_FALLBACK)
+    mock_ip_limiter = RateLimiter(redis_client=None, capacity=30, refill_rate=1.0, failure_mode=FailureMode.LOCAL_FALLBACK)
+    monkeypatch.setattr(main, "limiter", mock_user_limiter)
+    monkeypatch.setattr(main, "ip_limiter", mock_ip_limiter)
+
+    client = TestClient(main.app)
+    user_id = f"test_success_issued_{uuid.uuid4().hex[:8]}"
+
+    det = main.detector
+    initial_issued = metrics_collector.challenges_issued_total
+
+    with patch.object(det, "compute_risk_score", return_value=(0.6, "suspicious")):
+        response = client.get("/limited-resource", headers={"user-id": user_id})
+        assert response.status_code == 403
+        assert "Verification challenge required" in response.json()["detail"]["message"]
+
+    assert metrics_collector.challenges_issued_total == initial_issued + 1
+
+
 # =============================================================================
 # Issue 9: rate_limiter.py — from dataclasses import dataclass appears after docstring
 # =============================================================================
@@ -266,9 +360,76 @@ def test_init_or_load_redis_model_uses_direct_hset():
     mock_redis.exists.return_value = False
 
     det = AdaptiveSpamDetector(redis_client=mock_redis)
-    # pipeline() should not have been called for centroid seeding
     mock_redis.pipeline.assert_not_called()
-    # direct hset() must have been called
     mock_redis.hset.assert_called_once()
     assert mock_redis.hset.call_args[0][0] == "model_state:centroids"
 
+
+# =============================================================================
+# Priority 4: Bounded verify_connection for client without connection pool
+# =============================================================================
+
+class MockNoPoolRedisClient:
+    """Simulates a custom Redis client without a connection_pool attribute."""
+    def __init__(self, delay: float = 0.0, should_fail: bool = False):
+        self.connection_pool = None
+        self.delay = delay
+        self.should_fail = should_fail
+
+    def ping(self):
+        if self.delay > 0:
+            time.sleep(self.delay)
+        if self.should_fail:
+            raise ConnectionError("Custom connection failure")
+        return True
+
+
+def test_verify_connection_without_connection_pool_fast_success():
+    """verify_connection succeeds quickly for a client without a connection pool."""
+    client = MockNoPoolRedisClient(delay=0.0)
+    limiter = RateLimiter(
+        redis_client=client,
+        failure_mode=FailureMode.FAIL_CLOSED
+    )
+    assert limiter.verify_connection(timeout=0.5) is True
+
+
+def test_verify_connection_without_connection_pool_times_out():
+    """verify_connection respects timeout bound even when client has no connection pool."""
+    # Client blocks for 1.0s, but timeout is 0.05s
+    client = MockNoPoolRedisClient(delay=1.0)
+
+    # 1. FAIL_CLOSED: raises RedisUnavailableError mentioning timeout
+    limiter_closed = RateLimiter(
+        redis_client=client,
+        failure_mode=FailureMode.FAIL_CLOSED
+    )
+    with pytest.raises(RedisUnavailableError) as exc_info:
+        limiter_closed.verify_connection(timeout=0.05)
+    assert "timed out after 0.05s" in str(exc_info.value)
+
+    # 2. FAIL_OPEN: returns False
+    limiter_open = RateLimiter(
+        redis_client=client,
+        failure_mode=FailureMode.FAIL_OPEN
+    )
+    assert limiter_open.verify_connection(timeout=0.05) is False
+
+    # 3. LOCAL_FALLBACK: returns False
+    limiter_fallback = RateLimiter(
+        redis_client=client,
+        failure_mode=FailureMode.LOCAL_FALLBACK
+    )
+    assert limiter_fallback.verify_connection(timeout=0.05) is False
+
+
+def test_verify_connection_without_connection_pool_error_propagation():
+    """verify_connection sanitizes and propagates errors from client without connection pool."""
+    client = MockNoPoolRedisClient(delay=0.0, should_fail=True)
+    limiter = RateLimiter(
+        redis_client=client,
+        failure_mode=FailureMode.FAIL_CLOSED
+    )
+    with pytest.raises(RedisUnavailableError) as exc_info:
+        limiter.verify_connection(timeout=0.5)
+    assert "Custom connection failure" in str(exc_info.value)
