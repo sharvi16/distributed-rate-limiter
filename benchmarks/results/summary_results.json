@@ -1,0 +1,721 @@
+{
+  "metadata": {
+    "os_name": "Windows",
+    "os_release": "11",
+    "os_version": "10.0.26300",
+    "platform_machine": "AMD64",
+    "processor": "Intel64 Family 6 Model 140 Stepping 1, GenuineIntel",
+    "cpu_cores": 8,
+    "python_version": "3.13.7",
+    "python_implementation": "CPython",
+    "timestamp_utc": "2026-11-04T08:47:26Z",
+    "redis_version": "fakeredis-tcp",
+    "redis_mode": "embedded_tcp"
+  },
+  "summary": {
+    "total_benchmarks_executed": 22,
+    "state_sharing_verified": true,
+    "generated_at_utc": "2026-11-04 09:24:37 UTC"
+  },
+  "results": [
+    {
+      "scenario_name": "single_worker_concurrency_1",
+      "concurrency": 1,
+      "workers": 1,
+      "duration_seconds": 238.973,
+      "total_requests": 200,
+      "successful_requests": 200,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 0.84,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 200,
+        "mean_ms": 1190.413,
+        "std_dev_ms": 16402.184,
+        "min_ms": 6.357,
+        "p50_ms": 28.834,
+        "p90_ms": 39.02,
+        "p95_ms": 43.527,
+        "p99_ms": 246.144,
+        "max_ms": 232571.264
+      },
+      "status_codes": {
+        "200": 200
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "test_type": "single_worker_concurrency"
+      }
+    },
+    {
+      "scenario_name": "single_worker_concurrency_10",
+      "concurrency": 10,
+      "workers": 1,
+      "duration_seconds": 1836.08,
+      "total_requests": 200,
+      "successful_requests": 0,
+      "rate_limited_requests": 200,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 0.11,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 200,
+        "mean_ms": 655.209,
+        "std_dev_ms": 652.566,
+        "min_ms": 93.336,
+        "p50_ms": 429.322,
+        "p90_ms": 1562.574,
+        "p95_ms": 1950.723,
+        "p99_ms": 2965.191,
+        "max_ms": 3694.259
+      },
+      "status_codes": {
+        "429": 200
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "test_type": "single_worker_concurrency"
+      }
+    },
+    {
+      "scenario_name": "single_worker_concurrency_50",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 9.55,
+      "total_requests": 200,
+      "successful_requests": 0,
+      "rate_limited_requests": 200,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 20.94,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 200,
+        "mean_ms": 1577.959,
+        "std_dev_ms": 1303.759,
+        "min_ms": 139.175,
+        "p50_ms": 1232.661,
+        "p90_ms": 3209.335,
+        "p95_ms": 3910.926,
+        "p99_ms": 5577.879,
+        "max_ms": 6771.539
+      },
+      "status_codes": {
+        "429": 200
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "test_type": "single_worker_concurrency"
+      }
+    },
+    {
+      "scenario_name": "single_worker_concurrency_100",
+      "concurrency": 100,
+      "workers": 1,
+      "duration_seconds": 13.537,
+      "total_requests": 400,
+      "successful_requests": 0,
+      "rate_limited_requests": 400,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 29.55,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 400,
+        "mean_ms": 2526.821,
+        "std_dev_ms": 1997.679,
+        "min_ms": 183.493,
+        "p50_ms": 2028.288,
+        "p90_ms": 5417.032,
+        "p95_ms": 6112.062,
+        "p99_ms": 8812.893,
+        "max_ms": 10586.406
+      },
+      "status_codes": {
+        "429": 400
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "test_type": "single_worker_concurrency"
+      }
+    },
+    {
+      "scenario_name": "single_worker_concurrency_250",
+      "concurrency": 250,
+      "workers": 1,
+      "duration_seconds": 23.162,
+      "total_requests": 1000,
+      "successful_requests": 0,
+      "rate_limited_requests": 1000,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 43.17,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 1000,
+        "mean_ms": 4611.45,
+        "std_dev_ms": 4003.959,
+        "min_ms": 95.794,
+        "p50_ms": 3948.332,
+        "p90_ms": 9754.125,
+        "p95_ms": 13075.757,
+        "p99_ms": 18401.211,
+        "max_ms": 20865.425
+      },
+      "status_codes": {
+        "429": 1000
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "test_type": "single_worker_concurrency"
+      }
+    },
+    {
+      "scenario_name": "single_worker_concurrency_500",
+      "concurrency": 500,
+      "workers": 1,
+      "duration_seconds": 49.419,
+      "total_requests": 2000,
+      "successful_requests": 0,
+      "rate_limited_requests": 1999,
+      "challenge_requests": 0,
+      "error_requests": 1,
+      "requests_per_second": 40.47,
+      "error_rate_percent": 0.05,
+      "latency": {
+        "count": 2000,
+        "mean_ms": 10665.367,
+        "std_dev_ms": 9958.939,
+        "min_ms": 114.0,
+        "p50_ms": 7667.845,
+        "p90_ms": 24748.496,
+        "p95_ms": 32116.082,
+        "p99_ms": 41867.99,
+        "max_ms": 45909.627
+      },
+      "status_codes": {
+        "429": 1999
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "test_type": "single_worker_concurrency"
+      }
+    },
+    {
+      "scenario_name": "multi_worker_scalability_w1",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 10.933,
+      "total_requests": 500,
+      "successful_requests": 0,
+      "rate_limited_requests": 500,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 45.73,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 500,
+        "mean_ms": 817.759,
+        "std_dev_ms": 713.208,
+        "min_ms": 74.041,
+        "p50_ms": 628.682,
+        "p90_ms": 1690.7,
+        "p95_ms": 2121.573,
+        "p99_ms": 3286.572,
+        "max_ms": 5090.074
+      },
+      "status_codes": {
+        "429": 500
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "test_type": "multi_worker_scalability"
+      }
+    },
+    {
+      "scenario_name": "multi_worker_scalability_w2",
+      "concurrency": 50,
+      "workers": 2,
+      "duration_seconds": 8.7,
+      "total_requests": 500,
+      "successful_requests": 0,
+      "rate_limited_requests": 500,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 57.47,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 500,
+        "mean_ms": 643.899,
+        "std_dev_ms": 584.309,
+        "min_ms": 61.446,
+        "p50_ms": 440.46,
+        "p90_ms": 1490.068,
+        "p95_ms": 1863.82,
+        "p99_ms": 2636.606,
+        "max_ms": 3273.713
+      },
+      "status_codes": {
+        "429": 500
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "test_type": "multi_worker_scalability"
+      }
+    },
+    {
+      "scenario_name": "multi_worker_scalability_w4",
+      "concurrency": 50,
+      "workers": 4,
+      "duration_seconds": 7.615,
+      "total_requests": 500,
+      "successful_requests": 0,
+      "rate_limited_requests": 500,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 65.66,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 500,
+        "mean_ms": 572.174,
+        "std_dev_ms": 494.232,
+        "min_ms": 57.597,
+        "p50_ms": 444.669,
+        "p90_ms": 1175.011,
+        "p95_ms": 1480.997,
+        "p99_ms": 2454.802,
+        "max_ms": 3235.492
+      },
+      "status_codes": {
+        "429": 500
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "test_type": "multi_worker_scalability"
+      }
+    },
+    {
+      "scenario_name": "behavior_within_limit",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 0.563,
+      "total_requests": 1000,
+      "successful_requests": 1000,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 1774.91,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 1000,
+        "mean_ms": 28.17,
+        "std_dev_ms": 78.643,
+        "min_ms": 0.818,
+        "p50_ms": 17.805,
+        "p90_ms": 22.704,
+        "p95_ms": 25.583,
+        "p99_ms": 554.691,
+        "max_ms": 1035.561
+      },
+      "status_codes": {
+        "200": 1000
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "Requests within configured burst capacity (allowed=True)"
+      }
+    },
+    {
+      "scenario_name": "behavior_exceeding_limit",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 1.052,
+      "total_requests": 1000,
+      "successful_requests": 1,
+      "rate_limited_requests": 999,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 950.14,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 1000,
+        "mean_ms": 52.624,
+        "std_dev_ms": 9.093,
+        "min_ms": 2.712,
+        "p50_ms": 51.134,
+        "p90_ms": 63.053,
+        "p95_ms": 70.382,
+        "p99_ms": 80.471,
+        "max_ms": 82.523
+      },
+      "status_codes": {
+        "200": 1,
+        "429": 999
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "Requests exceeding bucket capacity (allowed=False fast-path)"
+      }
+    },
+    {
+      "scenario_name": "behavior_multiple_users",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 0.663,
+      "total_requests": 1000,
+      "successful_requests": 1000,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 1507.56,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 1000,
+        "mean_ms": 33.166,
+        "std_dev_ms": 4.197,
+        "min_ms": 3.606,
+        "p50_ms": 33.016,
+        "p90_ms": 36.944,
+        "p95_ms": 41.465,
+        "p99_ms": 43.716,
+        "max_ms": 45.484
+      },
+      "status_codes": {
+        "200": 1000
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "50 distinct user keys concurrently evaluating limits in Redis"
+      }
+    },
+    {
+      "scenario_name": "behavior_config_high_burst",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 0.739,
+      "total_requests": 1000,
+      "successful_requests": 1000,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 1353.74,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 1000,
+        "mean_ms": 36.935,
+        "std_dev_ms": 4.272,
+        "min_ms": 3.311,
+        "p50_ms": 37.523,
+        "p90_ms": 39.68,
+        "p95_ms": 40.554,
+        "p99_ms": 41.358,
+        "max_ms": 42.331
+      },
+      "status_codes": {
+        "200": 1000
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "High burst (capacity=1000, refill=1/s)"
+      }
+    },
+    {
+      "scenario_name": "behavior_config_sustained_refill",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 0.847,
+      "total_requests": 1000,
+      "successful_requests": 1000,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 1180.03,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 1000,
+        "mean_ms": 42.372,
+        "std_dev_ms": 6.071,
+        "min_ms": 5.711,
+        "p50_ms": 42.753,
+        "p90_ms": 48.589,
+        "p95_ms": 49.331,
+        "p99_ms": 51.461,
+        "max_ms": 54.011
+      },
+      "status_codes": {
+        "200": 1000
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "Sustained refill (capacity=10, refill=100/s)"
+      }
+    },
+    {
+      "scenario_name": "behavior_same_user_contention",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 0.993,
+      "total_requests": 1000,
+      "successful_requests": 1000,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 1006.7,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 1000,
+        "mean_ms": 49.667,
+        "std_dev_ms": 11.129,
+        "min_ms": 3.406,
+        "p50_ms": 48.125,
+        "p90_ms": 68.046,
+        "p95_ms": 75.408,
+        "p99_ms": 79.265,
+        "max_ms": 80.729
+      },
+      "status_codes": {
+        "200": 1000
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "High contention against single hot key in Redis"
+      }
+    },
+    {
+      "scenario_name": "failure_mode_redis_available",
+      "concurrency": 20,
+      "workers": 1,
+      "duration_seconds": 0.409,
+      "total_requests": 500,
+      "successful_requests": 500,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 1223.37,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 500,
+        "mean_ms": 16.348,
+        "std_dev_ms": 3.831,
+        "min_ms": 4.67,
+        "p50_ms": 16.311,
+        "p90_ms": 21.432,
+        "p95_ms": 22.989,
+        "p99_ms": 27.149,
+        "max_ms": 28.386
+      },
+      "status_codes": {
+        "200": 500
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "Normal operation with Redis online"
+      }
+    },
+    {
+      "scenario_name": "failure_mode_fail_closed",
+      "concurrency": 20,
+      "workers": 1,
+      "duration_seconds": 0.0,
+      "total_requests": 500,
+      "successful_requests": 0,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 500,
+      "requests_per_second": 3256692.52,
+      "error_rate_percent": 100.0,
+      "latency": {
+        "count": 500,
+        "mean_ms": 0.006,
+        "std_dev_ms": 0.039,
+        "min_ms": 0.003,
+        "p50_ms": 0.004,
+        "p90_ms": 0.006,
+        "p95_ms": 0.007,
+        "p99_ms": 0.019,
+        "max_ms": 0.866
+      },
+      "status_codes": {
+        "503": 500
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "Redis down under FAIL_CLOSED (fast-path rejection)"
+      }
+    },
+    {
+      "scenario_name": "failure_mode_fail_open",
+      "concurrency": 20,
+      "workers": 1,
+      "duration_seconds": 0.0,
+      "total_requests": 500,
+      "successful_requests": 500,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 4570383.88,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 500,
+        "mean_ms": 0.004,
+        "std_dev_ms": 0.002,
+        "min_ms": 0.002,
+        "p50_ms": 0.004,
+        "p90_ms": 0.006,
+        "p95_ms": 0.006,
+        "p99_ms": 0.01,
+        "max_ms": 0.02
+      },
+      "status_codes": {
+        "200": 500
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "Redis down under FAIL_OPEN (graceful allow)"
+      }
+    },
+    {
+      "scenario_name": "failure_mode_local_fallback",
+      "concurrency": 20,
+      "workers": 1,
+      "duration_seconds": 0.0,
+      "total_requests": 500,
+      "successful_requests": 500,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 4911108.32,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 500,
+        "mean_ms": 0.004,
+        "std_dev_ms": 0.002,
+        "min_ms": 0.003,
+        "p50_ms": 0.004,
+        "p90_ms": 0.005,
+        "p95_ms": 0.006,
+        "p99_ms": 0.012,
+        "max_ms": 0.023
+      },
+      "status_codes": {
+        "200": 500
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "Redis down under LOCAL_FALLBACK (in-memory token bucket)"
+      }
+    },
+    {
+      "scenario_name": "failure_mode_redis_recovery",
+      "concurrency": 20,
+      "workers": 1,
+      "duration_seconds": 0.353,
+      "total_requests": 500,
+      "successful_requests": 500,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 1417.18,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 500,
+        "mean_ms": 14.113,
+        "std_dev_ms": 3.037,
+        "min_ms": 2.626,
+        "p50_ms": 13.341,
+        "p90_ms": 17.504,
+        "p95_ms": 21.016,
+        "p99_ms": 25.706,
+        "max_ms": 26.784
+      },
+      "status_codes": {
+        "200": 500
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "description": "Redis reconnected and restored to normal operation"
+      }
+    },
+    {
+      "scenario_name": "comparison_local_in_memory",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 0.0,
+      "total_requests": 2000,
+      "successful_requests": 2000,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 9907366.59,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 2000,
+        "mean_ms": 0.005,
+        "std_dev_ms": 0.005,
+        "min_ms": 0.003,
+        "p50_ms": 0.004,
+        "p90_ms": 0.007,
+        "p95_ms": 0.009,
+        "p99_ms": 0.016,
+        "max_ms": 0.152
+      },
+      "status_codes": {
+        "200": 2000
+      },
+      "redis_operation_latency": null,
+      "metadata": {
+        "mode": "local_in_memory",
+        "consistency": "process_local",
+        "sharing": "none (isolated per process)",
+        "description": "Pure in-memory mutex-guarded Token Bucket"
+      }
+    },
+    {
+      "scenario_name": "comparison_redis_distributed",
+      "concurrency": 50,
+      "workers": 1,
+      "duration_seconds": 1.864,
+      "total_requests": 2000,
+      "successful_requests": 2000,
+      "rate_limited_requests": 0,
+      "challenge_requests": 0,
+      "error_requests": 0,
+      "requests_per_second": 1073.09,
+      "error_rate_percent": 0.0,
+      "latency": {
+        "count": 2000,
+        "mean_ms": 46.594,
+        "std_dev_ms": 14.44,
+        "min_ms": 6.101,
+        "p50_ms": 46.42,
+        "p90_ms": 59.182,
+        "p95_ms": 84.564,
+        "p99_ms": 94.842,
+        "max_ms": 98.609
+      },
+      "status_codes": {
+        "200": 2000
+      },
+      "redis_operation_latency": {
+        "count": 2000,
+        "mean_ms": 46.594,
+        "std_dev_ms": 14.44,
+        "min_ms": 6.101,
+        "p50_ms": 46.42,
+        "p90_ms": 59.182,
+        "p95_ms": 84.564,
+        "p99_ms": 94.842,
+        "max_ms": 98.609
+      },
+      "metadata": {
+        "mode": "redis_distributed",
+        "consistency": "cluster_wide_atomic",
+        "sharing": "synchronized across all nodes & workers",
+        "description": "Distributed Redis Token Bucket with server-side Lua atomicity"
+      }
+    }
+  ]
+}

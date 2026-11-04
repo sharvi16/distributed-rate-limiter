@@ -1,0 +1,157 @@
+[
+  {
+    "scenario_name": "failure_mode_redis_available",
+    "concurrency": 20,
+    "workers": 1,
+    "duration_seconds": 0.409,
+    "total_requests": 500,
+    "successful_requests": 500,
+    "rate_limited_requests": 0,
+    "challenge_requests": 0,
+    "error_requests": 0,
+    "requests_per_second": 1223.37,
+    "error_rate_percent": 0.0,
+    "latency": {
+      "count": 500,
+      "mean_ms": 16.348,
+      "std_dev_ms": 3.831,
+      "min_ms": 4.67,
+      "p50_ms": 16.311,
+      "p90_ms": 21.432,
+      "p95_ms": 22.989,
+      "p99_ms": 27.149,
+      "max_ms": 28.386
+    },
+    "status_codes": {
+      "200": 500
+    },
+    "redis_operation_latency": null,
+    "metadata": {
+      "description": "Normal operation with Redis online"
+    }
+  },
+  {
+    "scenario_name": "failure_mode_fail_closed",
+    "concurrency": 20,
+    "workers": 1,
+    "duration_seconds": 0.0,
+    "total_requests": 500,
+    "successful_requests": 0,
+    "rate_limited_requests": 0,
+    "challenge_requests": 0,
+    "error_requests": 500,
+    "requests_per_second": 3256692.52,
+    "error_rate_percent": 100.0,
+    "latency": {
+      "count": 500,
+      "mean_ms": 0.006,
+      "std_dev_ms": 0.039,
+      "min_ms": 0.003,
+      "p50_ms": 0.004,
+      "p90_ms": 0.006,
+      "p95_ms": 0.007,
+      "p99_ms": 0.019,
+      "max_ms": 0.866
+    },
+    "status_codes": {
+      "503": 500
+    },
+    "redis_operation_latency": null,
+    "metadata": {
+      "description": "Redis down under FAIL_CLOSED (fast-path rejection)"
+    }
+  },
+  {
+    "scenario_name": "failure_mode_fail_open",
+    "concurrency": 20,
+    "workers": 1,
+    "duration_seconds": 0.0,
+    "total_requests": 500,
+    "successful_requests": 500,
+    "rate_limited_requests": 0,
+    "challenge_requests": 0,
+    "error_requests": 0,
+    "requests_per_second": 4570383.88,
+    "error_rate_percent": 0.0,
+    "latency": {
+      "count": 500,
+      "mean_ms": 0.004,
+      "std_dev_ms": 0.002,
+      "min_ms": 0.002,
+      "p50_ms": 0.004,
+      "p90_ms": 0.006,
+      "p95_ms": 0.006,
+      "p99_ms": 0.01,
+      "max_ms": 0.02
+    },
+    "status_codes": {
+      "200": 500
+    },
+    "redis_operation_latency": null,
+    "metadata": {
+      "description": "Redis down under FAIL_OPEN (graceful allow)"
+    }
+  },
+  {
+    "scenario_name": "failure_mode_local_fallback",
+    "concurrency": 20,
+    "workers": 1,
+    "duration_seconds": 0.0,
+    "total_requests": 500,
+    "successful_requests": 500,
+    "rate_limited_requests": 0,
+    "challenge_requests": 0,
+    "error_requests": 0,
+    "requests_per_second": 4911108.32,
+    "error_rate_percent": 0.0,
+    "latency": {
+      "count": 500,
+      "mean_ms": 0.004,
+      "std_dev_ms": 0.002,
+      "min_ms": 0.003,
+      "p50_ms": 0.004,
+      "p90_ms": 0.005,
+      "p95_ms": 0.006,
+      "p99_ms": 0.012,
+      "max_ms": 0.023
+    },
+    "status_codes": {
+      "200": 500
+    },
+    "redis_operation_latency": null,
+    "metadata": {
+      "description": "Redis down under LOCAL_FALLBACK (in-memory token bucket)"
+    }
+  },
+  {
+    "scenario_name": "failure_mode_redis_recovery",
+    "concurrency": 20,
+    "workers": 1,
+    "duration_seconds": 0.353,
+    "total_requests": 500,
+    "successful_requests": 500,
+    "rate_limited_requests": 0,
+    "challenge_requests": 0,
+    "error_requests": 0,
+    "requests_per_second": 1417.18,
+    "error_rate_percent": 0.0,
+    "latency": {
+      "count": 500,
+      "mean_ms": 14.113,
+      "std_dev_ms": 3.037,
+      "min_ms": 2.626,
+      "p50_ms": 13.341,
+      "p90_ms": 17.504,
+      "p95_ms": 21.016,
+      "p99_ms": 25.706,
+      "max_ms": 26.784
+    },
+    "status_codes": {
+      "200": 500
+    },
+    "redis_operation_latency": null,
+    "metadata": {
+      "description": "Redis reconnected and restored to normal operation"
+    }
+  }
+]

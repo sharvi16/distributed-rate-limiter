@@ -1,0 +1,95 @@
+[
+  {
+    "scenario_name": "multi_worker_scalability_w1",
+    "concurrency": 50,
+    "workers": 1,
+    "duration_seconds": 10.933,
+    "total_requests": 500,
+    "successful_requests": 0,
+    "rate_limited_requests": 500,
+    "challenge_requests": 0,
+    "error_requests": 0,
+    "requests_per_second": 45.73,
+    "error_rate_percent": 0.0,
+    "latency": {
+      "count": 500,
+      "mean_ms": 817.759,
+      "std_dev_ms": 713.208,
+      "min_ms": 74.041,
+      "p50_ms": 628.682,
+      "p90_ms": 1690.7,
+      "p95_ms": 2121.573,
+      "p99_ms": 3286.572,
+      "max_ms": 5090.074
+    },
+    "status_codes": {
+      "429": 500
+    },
+    "redis_operation_latency": null,
+    "metadata": {
+      "test_type": "multi_worker_scalability"
+    }
+  },
+  {
+    "scenario_name": "multi_worker_scalability_w2",
+    "concurrency": 50,
+    "workers": 2,
+    "duration_seconds": 8.7,
+    "total_requests": 500,
+    "successful_requests": 0,
+    "rate_limited_requests": 500,
+    "challenge_requests": 0,
+    "error_requests": 0,
+    "requests_per_second": 57.47,
+    "error_rate_percent": 0.0,
+    "latency": {
+      "count": 500,
+      "mean_ms": 643.899,
+      "std_dev_ms": 584.309,
+      "min_ms": 61.446,
+      "p50_ms": 440.46,
+      "p90_ms": 1490.068,
+      "p95_ms": 1863.82,
+      "p99_ms": 2636.606,
+      "max_ms": 3273.713
+    },
+    "status_codes": {
+      "429": 500
+    },
+    "redis_operation_latency": null,
+    "metadata": {
+      "test_type": "multi_worker_scalability"
+    }
+  },
+  {
+    "scenario_name": "multi_worker_scalability_w4",
+    "concurrency": 50,
+    "workers": 4,
+    "duration_seconds": 7.615,
+    "total_requests": 500,
+    "successful_requests": 0,
+    "rate_limited_requests": 500,
+    "challenge_requests": 0,
+    "error_requests": 0,
+    "requests_per_second": 65.66,
+    "error_rate_percent": 0.0,
+    "latency": {
+      "count": 500,
+      "mean_ms": 572.174,
+      "std_dev_ms": 494.232,
+      "min_ms": 57.597,
+      "p50_ms": 444.669,
+      "p90_ms": 1175.011,
+      "p95_ms": 1480.997,
+      "p99_ms": 2454.802,
+      "max_ms": 3235.492
+    },
+    "status_codes": {
+      "429": 500
+    },
+    "redis_operation_latency": null,
+    "metadata": {
+      "test_type": "multi_worker_scalability"
+    }
+  }
+]

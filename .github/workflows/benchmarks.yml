@@ -1,0 +1,79 @@
+name: Performance Benchmarks & Scalability Evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: 'Run in quick mode (reduced durations and concurrency for rapid sanity checks)'
+        type: boolean
+        default: false
+      scenarios:
+        description: 'Comma-separated scenarios to execute (empty runs all: A,B,C,D,E)'
+        type: string
+        default: ''
+
+jobs:
+  benchmark:
+    name: Run Benchmark Suite
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install locust
+
+      - name: Execute Benchmark Suite
+        env:
+          REDIS_URL: redis://localhost:6379
+          REQUIRE_AUTH: "true"
+          ENVIRONMENT: "production"
+          AUTH_SECRET_KEY: "c47a98b0f81d2f195e26b17c80523f46da9a738c642e051783e4bb9057d2913e"
+          ADMIN_API_KEY: "prod-admin-secret-key-12345"
+        run: |
+          CMD="python -m benchmarks.runner --output-dir benchmarks/results"
+          if [ "${{ inputs.quick }}" = "true" ]; then
+            CMD="$CMD --quick"
+          fi
+          if [ -n "${{ inputs.scenarios }}" ]; then
+            CMD="$CMD --scenarios ${{ inputs.scenarios }}"
+          fi
+          echo "Executing: $CMD"
+          eval $CMD
+
+      - name: Upload Benchmark Results Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmarks/results/
+            benchmarks/REPORT.md
+
+      - name: Render Benchmark Summary into Job Summary
+        if: always()
+        run: |
+          if [ -f "benchmarks/REPORT.md" ]; then
+            cat benchmarks/REPORT.md >> $GITHUB_STEP_SUMMARY
+          fi
