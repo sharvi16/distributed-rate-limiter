@@ -37,6 +37,9 @@ class AdaptiveSpamDetector:
         self._local_challenges: Dict[str, Dict[str, Any]] = {}
         self._local_strikes: Dict[str, int] = {}  # Repeat offender strikes
         self._local_verified_humans: Dict[str, float] = {}  # user_id -> verified_until_timestamp
+        self._local_device_ips: Dict[str, Dict[str, float]] = {}
+        self._local_ip_identities: Dict[str, Dict[str, float]] = {}
+        self._local_challenge_throttles: Dict[str, List[float]] = {}
         
         # Model parameter centroids (seeded with reasonable prior distributions)
         # Features: [interval_std, burst_count, mean_interval]
@@ -302,12 +305,12 @@ class AdaptiveSpamDetector:
     # -------------------------------------------------------------------------
 
     def compute_risk_score(self, features: Dict[str, float], user_id: str = "") -> Tuple[float, str]:
-        self.sync_model_from_redis()
         """
         Computes a continuous risk score between 0.0 (definitely human) and 1.0 (definitely spammer).
         Uses Gaussian likelihood comparison against current adaptive centroids,
         combined with client signature entropy and repeat offender history.
         """
+        self.sync_model_from_redis()
         # Vector: [interval_std, burst_count, mean_interval]
         x = [
             float(features.get("interval_std", 0.0)),
@@ -384,8 +387,7 @@ class AdaptiveSpamDetector:
         try:
             if not self.redis.exists(key):
                 # Seed Redis with initial prior distributions
-                pipe = self.redis.pipeline()
-                pipe.hset(key, mapping={
+                self.redis.hset(key, mapping={
                     "human:mean:0": 1.8, "human:mean:1": 1.2, "human:mean:2": 2.5,
                     "human:var:0": 1.0, "human:var:1": 0.5, "human:var:2": 1.5,
                     "human:count": 50,
@@ -395,7 +397,6 @@ class AdaptiveSpamDetector:
                     "total_updates": 0,
                     "version": 1
                 })
-                pipe.execute()
             self.sync_model_from_redis(force=True)
         except Exception:
             pass
@@ -499,6 +500,41 @@ class AdaptiveSpamDetector:
           Simple arithmetic challenges provide lightweight friction against basic scrapers,
           but do NOT provide cryptographic CAPTCHA or absolute proof-of-human guarantees.
         """
+        # Per-user throttle: max 3 challenges per 5-minute window (300s)
+        now = time.time()
+        throttle_exceeded = False
+        if self.redis:
+            try:
+                throttle_key = f"challenge_throttle:{user_id}"
+                count = self.redis.incr(throttle_key)
+                if count == 1:
+                    self.redis.expire(throttle_key, 300)
+                elif self.redis.ttl(throttle_key) == -1:
+                    self.redis.expire(throttle_key, 300)
+                if count > 3:
+                    throttle_exceeded = True
+            except Exception:
+                pass
+
+        with self._lock:
+            history = self._local_challenge_throttles.get(user_id, [])
+            history = [t for t in history if now - t < 300.0]
+            if not throttle_exceeded:
+                if len(history) >= 3:
+                    throttle_exceeded = True
+                else:
+                    history.append(now)
+            self._local_challenge_throttles[user_id] = history
+
+        if throttle_exceeded:
+            self.jail_user(user_id, duration_seconds=300)
+            return {
+                "error": "Challenge generation rate limit exceeded. User placed in penalty box.",
+                "user_id": user_id,
+                "jailed": True,
+                "retry_after": 300
+            }
+
         challenge_id = f"ch_{secrets.token_urlsafe(18)}"
         num1 = secrets.randbelow(17) + 3  # 3 to 19
         num2 = secrets.randbelow(8) + 2   # 2 to 9
@@ -786,8 +822,6 @@ class AdaptiveSpamDetector:
 
         # 2. Local In-Memory Fallback
         with self._lock:
-            if not hasattr(self, "_local_device_ips"):
-                self._local_device_ips: Dict[str, Dict[str, float]] = {}
             if device_id not in self._local_device_ips:
                 self._local_device_ips[device_id] = {}
 
@@ -830,8 +864,6 @@ class AdaptiveSpamDetector:
 
         # 2. Local In-Memory Fallback
         with self._lock:
-            if not hasattr(self, "_local_ip_identities"):
-                self._local_ip_identities: Dict[str, Dict[str, float]] = {}
             if client_ip not in self._local_ip_identities:
                 self._local_ip_identities[client_ip] = {}
 
@@ -938,23 +970,48 @@ class AdaptiveSpamDetector:
         """
         Returns model state, current centroids, and operational metrics.
         """
+        now = time.time()
         with self._lock:
-            return {
-                "metrics": dict(self.stats),
-                "model_centroids": {
-                    "human": {
-                        "mean_interval_std": self.model_state["human"]["mean"][0],
-                        "mean_burst_count": self.model_state["human"]["mean"][1],
-                        "mean_request_interval": self.model_state["human"]["mean"][2],
-                        "trained_samples": self.model_state["human"]["count"]
-                    },
-                    "spammer": {
-                        "mean_interval_std": self.model_state["spammer"]["mean"][0],
-                        "mean_burst_count": self.model_state["spammer"]["mean"][1],
-                        "mean_request_interval": self.model_state["spammer"]["mean"][2],
-                        "trained_samples": self.model_state["spammer"]["count"]
-                    },
-                    "total_self_learning_updates": self.model_state["total_updates"]
+            active_local = sum(1 for exp in self._local_penalty_box.values() if exp > now)
+            metrics_dict = dict(self.stats)
+            centroids = {
+                "human": {
+                    "mean_interval_std": self.model_state["human"]["mean"][0],
+                    "mean_burst_count": self.model_state["human"]["mean"][1],
+                    "mean_request_interval": self.model_state["human"]["mean"][2],
+                    "trained_samples": self.model_state["human"]["count"]
                 },
-                "active_jailed_users": len(self._local_penalty_box)
+                "spammer": {
+                    "mean_interval_std": self.model_state["spammer"]["mean"][0],
+                    "mean_burst_count": self.model_state["spammer"]["mean"][1],
+                    "mean_request_interval": self.model_state["spammer"]["mean"][2],
+                    "trained_samples": self.model_state["spammer"]["count"]
+                },
+                "total_self_learning_updates": self.model_state["total_updates"]
             }
+
+        redis_jailed_count = 0
+        redis_active = False
+        if self.redis:
+            try:
+                count = 0
+                for _ in self.redis.scan_iter("penalty_box:*"):
+                    count += 1
+                redis_jailed_count = count
+                redis_active = True
+            except Exception:
+                redis_active = False
+
+        if redis_active:
+            total_jailed = redis_jailed_count + active_local
+            note = "Aggregated count from Redis cluster (penalty_box:*) and local in-memory fallback state."
+        else:
+            total_jailed = active_local
+            note = "Count reflects local in-memory fallback state only (Redis unavailable or not connected)."
+
+        return {
+            "metrics": metrics_dict,
+            "model_centroids": centroids,
+            "active_jailed_users": total_jailed,
+            "active_jailed_users_note": note
+        }

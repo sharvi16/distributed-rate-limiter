@@ -86,6 +86,8 @@ class MetricsCollector:
             except Exception:
                 pass
 
+    inc_challenges_verified = inc_challenge_verified
+
     def inc_challenge_exhausted(self):
         with self._lock:
             self.challenges_exhausted_total += 1

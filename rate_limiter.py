@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 """
 Distributed Token Bucket Rate Limiter with Redis Lua Atomicity and Configurable Failure Modes.
 
@@ -33,6 +32,7 @@ Architectural Guarantees & Redis Time Semantics:
      and refresh key TTL without deducting, preserving correct accrued token state.
 """
 
+from dataclasses import dataclass
 from enum import Enum
 import math
 import os
@@ -634,11 +634,12 @@ class RateLimiter:
             self._register_script()
         except ValueError:
             raise
-        except Exception:
+        except Exception as e:
+            self.redis = None
             self.check_limit_script = None
             if self.failure_mode == FailureMode.FAIL_CLOSED:
-                # Do not suppress if strictly failing closed on startup
-                pass
+                clean_err = sanitize_redis_error_message(e)
+                raise RedisUnavailableError(f"Redis initialization failed: {clean_err}") from e
 
     def verify_connection(self, timeout: float = 1.0) -> bool:
         """
@@ -743,8 +744,12 @@ class RateLimiter:
                     keys=[key],
                     args=[snapshot.capacity, snapshot.refill_rate, tokens]
                 )
-                allowed = bool(result[0] == 1)
-                remaining = max(0.0, float(result[1]))
+                try:
+                    allowed = bool(result[0] == 1)
+                    remaining = max(0.0, float(result[1]))
+                except (TypeError, IndexError) as parse_err:
+                    return self._handle_check_limit_failure(user_id, tokens, parse_err, snapshot=snapshot)
+
                 reset_after = max(0.0, (snapshot.capacity - remaining) / snapshot.refill_rate)
                 retry_after = max(1, math.ceil((tokens - remaining) / snapshot.refill_rate)) if not allowed else None
                 return RateLimitResult(

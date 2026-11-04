@@ -28,28 +28,6 @@ from auth import (
 from metrics import metrics_collector
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    FastAPI lifespan handler executing startup configuration validation and synchronization.
-    Ensures authentication, encryption keys, admin secrets, and rate limiter
-    environment variables are verified and synchronized before accepting incoming HTTP requests.
-    Validates Redis connectivity and authentication with a bounded-time PING.
-    """
-    validate_auth_configuration()
-    sync_rate_limiter_configuration()
-    limiter.verify_connection(timeout=1.0)
-    ip_limiter.verify_connection(timeout=1.0)
-    yield
-
-
-app = FastAPI(
-    title="Distributed Rate Limiter with Self-Learning Spam Detection",
-    description="Adaptive rate limiting using Token Bucket algorithm, Behavioral Feature Extraction, and Online Self-Learning Anomaly Detection.",
-    version="2.0.0",
-    lifespan=lifespan
-)
-
 # -----------------------------------------------------------------------------
 # Service Initializations
 # -----------------------------------------------------------------------------
@@ -147,6 +125,29 @@ def sync_rate_limiter_configuration() -> None:
     )
     detector.redis = limiter.redis
     metrics_collector.set_redis(limiter.redis)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan handler executing startup configuration validation and synchronization.
+    Ensures authentication, encryption keys, admin secrets, and rate limiter
+    environment variables are verified and synchronized before accepting incoming HTTP requests.
+    Validates Redis connectivity and authentication with a bounded-time PING.
+    """
+    validate_auth_configuration()
+    sync_rate_limiter_configuration()
+    limiter.verify_connection(timeout=1.0)
+    ip_limiter.verify_connection(timeout=1.0)
+    yield
+
+
+app = FastAPI(
+    title="Distributed Rate Limiter with Self-Learning Spam Detection",
+    description="Adaptive rate limiting using Token Bucket algorithm, Behavioral Feature Extraction, and Online Self-Learning Anomaly Detection.",
+    version="2.0.0",
+    lifespan=lifespan
+)
 
 
 def format_token_limit(val: float) -> str:
@@ -549,6 +550,16 @@ def limited_resource(
         metrics_collector.inc_challenge_issued()
         metrics_collector.inc_request("challenge_required")
         challenge = detector.generate_challenge(user_id, features)
+        if challenge.get("jailed"):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={
+                    "message": "Challenge generation limit exceeded. User placed in penalty box.",
+                    "user_id": user_id,
+                    "retry_after": challenge.get("retry_after", 300)
+                },
+                headers={"Retry-After": str(challenge.get("retry_after", 300))}
+            )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -591,6 +602,7 @@ def verify_challenge(
             detail={"success": False, "message": message}
         )
 
+    metrics_collector.inc_challenge_verified()
     return {
         "success": True,
         "message": message,
