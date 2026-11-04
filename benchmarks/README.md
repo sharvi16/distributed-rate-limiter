@@ -89,6 +89,29 @@ python -m benchmarks.runner --output-dir my_benchmarks/run_01
 
 ---
 
+## Measurement Methodology & Rigor
+
+To ensure trustworthy, reproducible, interview-grade performance results, the suite strictly adheres to the following measurement principles:
+
+1. **True Wall-Clock Duration**:
+   Throughput ($RPS$) is calculated strictly as `total_requests / elapsed_seconds`, where `elapsed_seconds` is measured using high-resolution hardware monotonic clocks (`time.perf_counter()`) encompassing the actual start-to-finish execution window of the thread/task pool. Synthetic approximations (such as `sum(latencies) / concurrency`) are strictly rejected.
+
+2. **Warm-up Phase Isolation**:
+   Before metrics collection begins, an isolated warm-up workload runs to prime TCP connection pools, pre-compile Lua scripts, and initialize server state. Warm-up requests and durations are completely excluded from reported request counts, throughput, and latency percentiles.
+
+3. **Strict 1:1 Request Accounting**:
+   Every dispatched request is accounted for 1:1 with an individual latency observation and categorized status:
+   $$\text{Total Requests} = \text{Successful (200)} + \text{Rate Limited (429)} + \text{Challenge (403)} + \text{Errors (5xx / Transport)}$$
+   The statistical aggregator strictly validates this invariant and guarantees `len(latencies_ms) == total_requests`.
+
+4. **Realistic Outage Simulation & Same-Instance Recovery**:
+   Scenario D uses a thread-safe `FaultInjectableRedisClient` to evaluate outage resilience (`FAIL_CLOSED`, `FAIL_OPEN`, `LOCAL_FALLBACK`) and reconnection recovery on the **exact same `RateLimiter` instance**, measuring real recovery probe latency without artificial mock resets.
+
+5. **Linear Interpolation Percentiles**:
+   Percentiles ($p50$, $p90$, $p95$, $p99$) are calculated using linear interpolation between nearest ranks, avoiding binning artifacts or staircase effects.
+
+---
+
 ## Scenario Descriptions
 
 ### Scenario A: Single-Worker Performance
@@ -165,3 +188,4 @@ Every benchmark run produces structured, machine-readable data and visual charts
 ## Automated CI/CD Benchmarking
 
 A standalone GitHub Actions workflow is provided at `.github/workflows/benchmarks.yml`. It runs on `workflow_dispatch` (on demand) against a dedicated `redis:7-alpine` container, publishes execution artifacts, and renders the executive summary directly into the GitHub Actions Job Summary.
+

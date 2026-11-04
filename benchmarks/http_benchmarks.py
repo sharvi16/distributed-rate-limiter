@@ -26,10 +26,12 @@ async def run_http_load_test(
     user_prefix: str = "bench_user",
     distinct_users: bool = True,
     redis_url: Optional[str] = None
-) -> Tuple[List[float], Dict[int, int], int]:
+) -> Tuple[List[float], Dict[int, int], int, float]:
     """
     Executes a high-concurrency HTTP load test against the API endpoint /limited-resource.
     Generates cryptographically valid HMAC-SHA256 signed bearer tokens for every user.
+    Strictly separates warm-up and measurement phases so warm-up duration and requests are excluded.
+    Returns: (latencies_ms, status_codes, error_count, measurement_duration_seconds)
     """
     # Pre-generate signed tokens to avoid crypto overhead skewing network measurements
     tokens = {}
@@ -60,10 +62,11 @@ async def run_http_load_test(
     timeout = httpx.Timeout(timeout_seconds)
 
     async with httpx.AsyncClient(base_url=base_url, limits=limits, timeout=timeout) as client:
-        # 1. Warm-up Phase
+        # Phase 1: Warm-up Phase (Executed and discarded before measurement timer begins)
         if warmup_requests > 0:
+            warmup_count = min(warmup_requests, max(concurrency, 10))
             warmup_tasks = []
-            for i in range(min(warmup_requests, concurrency)):
+            for i in range(warmup_count):
                 uid = users_list[i % len(users_list)]
                 token = tokens[uid]
                 u_ip = user_ips.get(uid, "198.51.100.1")
@@ -75,7 +78,7 @@ async def run_http_load_test(
                 warmup_tasks.append(client.get("/limited-resource", headers=headers))
             await asyncio.gather(*warmup_tasks, return_exceptions=True)
 
-        # 2. Measurement Phase
+        # Phase 2: Measurement Phase
         latencies_ms: List[float] = []
         status_codes: Dict[int, int] = {}
         error_count: int = 0
@@ -115,10 +118,13 @@ async def run_http_load_test(
                 finally:
                     queue.task_done()
 
+        # Start timer immediately prior to launching measured requests
+        measure_start = time.perf_counter()
         workers_pool = [asyncio.create_task(worker()) for _ in range(concurrency)]
         await asyncio.gather(*workers_pool)
+        measure_duration = max(time.perf_counter() - measure_start, 0.0001)
 
-    return latencies_ms, status_codes, error_count
+    return latencies_ms, status_codes, error_count, measure_duration
 
 
 def benchmark_single_worker_concurrency(
@@ -142,8 +148,7 @@ def benchmark_single_worker_concurrency(
 
             print(f" -> Testing concurrency={conc:3d} clients ({total_reqs} requests)...", end="", flush=True)
 
-            t_start = time.perf_counter()
-            latencies_ms, status_codes, errors = asyncio.run(
+            latencies_ms, status_codes, errors, duration = asyncio.run(
                 run_http_load_test(
                     base_url=base_url,
                     concurrency=conc,
@@ -155,7 +160,6 @@ def benchmark_single_worker_concurrency(
                     redis_url=redis_url
                 )
             )
-            duration = time.perf_counter() - t_start
 
             res = BenchmarkResult.create(
                 scenario_name=f"single_worker_concurrency_{conc}",
@@ -199,8 +203,7 @@ def benchmark_multi_worker_scalability(
         with UvicornServerManager(config, workers=w_count, redis_url=redis_url) as base_url:
             print(" ready! Executing load test...", end="", flush=True)
 
-            t_start = time.perf_counter()
-            latencies_ms, status_codes, errors = asyncio.run(
+            latencies_ms, status_codes, errors, duration = asyncio.run(
                 run_http_load_test(
                     base_url=base_url,
                     concurrency=concurrency,
@@ -212,7 +215,6 @@ def benchmark_multi_worker_scalability(
                     redis_url=redis_url
                 )
             )
-            duration = time.perf_counter() - t_start
 
             res = BenchmarkResult.create(
                 scenario_name=f"multi_worker_scalability_w{w_count}",

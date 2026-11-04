@@ -3,15 +3,15 @@
 <line x1="80" y1="390.0" x2="760" y2="390.0" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3,3" />
 <text x="70" y="394.0" text-anchor="end" font-size="11" fill="#64748b">0</text>
 <line x1="80" y1="324.0" x2="760" y2="324.0" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3,3" />
-<text x="70" y="328.0" text-anchor="end" font-size="11" fill="#64748b">8,374</text>
+<text x="70" y="328.0" text-anchor="end" font-size="11" fill="#64748b">17,389</text>
 <line x1="80" y1="258.0" x2="760" y2="258.0" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3,3" />
-<text x="70" y="262.0" text-anchor="end" font-size="11" fill="#64748b">16,747</text>
+<text x="70" y="262.0" text-anchor="end" font-size="11" fill="#64748b">34,779</text>
 <line x1="80" y1="192.0" x2="760" y2="192.0" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3,3" />
-<text x="70" y="196.0" text-anchor="end" font-size="11" fill="#64748b">25,121</text>
+<text x="70" y="196.0" text-anchor="end" font-size="11" fill="#64748b">52,168</text>
 <line x1="80" y1="126.0" x2="760" y2="126.0" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3,3" />
-<text x="70" y="130.0" text-anchor="end" font-size="11" fill="#64748b">33,494</text>
+<text x="70" y="130.0" text-anchor="end" font-size="11" fill="#64748b">69,558</text>
 <line x1="80" y1="60.0" x2="760" y2="60.0" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3,3" />
-<text x="70" y="64.0" text-anchor="end" font-size="11" fill="#64748b">41,868</text>
+<text x="70" y="64.0" text-anchor="end" font-size="11" fill="#64748b">86,947</text>
 <text x="80.0" y="410" text-anchor="middle" font-size="12" fill="#475569">1</text>
 <text x="216.0" y="410" text-anchor="middle" font-size="12" fill="#475569">10</text>
 <text x="352.0" y="410" text-anchor="middle" font-size="12" fill="#475569">50</text>
@@ -22,26 +22,26 @@
 <line x1="80" y1="390" x2="760" y2="390" stroke="#94a3b8" stroke-width="1.5" />
 <text x="400" y="435" text-anchor="middle" font-size="12" font-weight="500" fill="#334155">Concurrency (Simultaneous Clients)</text>
 <text x="20" y="225" text-anchor="middle" font-size="12" font-weight="500" fill="#334155" transform="rotate(-90 20 225)">Latency (Milliseconds)</text>
-<polyline fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="80.0,389.8 216.0,386.6 352.0,380.3 488.0,374.0 624.0,358.9 760.0,329.6" />
-<circle cx="80.0" cy="389.8" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="216.0" cy="386.6" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="352.0" cy="380.3" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="488.0" cy="374.0" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="624.0" cy="358.9" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="760.0" cy="329.6" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
-<polyline fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="80.0,389.7 216.0,374.6 352.0,359.2 488.0,341.8 624.0,286.9 760.0,136.9" />
-<circle cx="80.0" cy="389.7" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="216.0" cy="374.6" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="352.0" cy="359.2" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="488.0" cy="341.8" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="624.0" cy="286.9" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="760.0" cy="136.9" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
-<polyline fill="none" stroke="#dc2626" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="80.0,388.1 216.0,366.6 352.0,346.0 488.0,320.5 624.0,245.0 760.0,60.0" />
-<circle cx="80.0" cy="388.1" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="216.0" cy="366.6" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="352.0" cy="346.0" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="488.0" cy="320.5" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
-<circle cx="624.0" cy="245.0" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
+<polyline fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="80.0,390.0 216.0,389.8 352.0,388.5 488.0,385.8 624.0,356.1 760.0,337.0" />
+<circle cx="80.0" cy="390.0" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="216.0" cy="389.8" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="352.0" cy="388.5" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="488.0" cy="385.8" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="624.0" cy="356.1" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="760.0" cy="337.0" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5" />
+<polyline fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="80.0,390.0 216.0,388.9 352.0,385.3 488.0,373.5 624.0,265.8 760.0,153.2" />
+<circle cx="80.0" cy="390.0" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="216.0" cy="388.9" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="352.0" cy="385.3" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="488.0" cy="373.5" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="624.0" cy="265.8" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="760.0" cy="153.2" r="4" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5" />
+<polyline fill="none" stroke="#dc2626" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="80.0,390.0 216.0,388.6 352.0,383.1 488.0,367.2 624.0,219.1 760.0,60.0" />
+<circle cx="80.0" cy="390.0" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="216.0" cy="388.6" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="352.0" cy="383.1" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="488.0" cy="367.2" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
+<circle cx="624.0" cy="219.1" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
 <circle cx="760.0" cy="60.0" r="4" fill="#dc2626" stroke="#ffffff" stroke-width="1.5" />
 <rect x="90" y="65" width="12" height="12" fill="#10b981" rx="2" />
 <text x="108" y="75" font-size="11" font-weight="500" fill="#334155">P50 Latency (ms)</text>

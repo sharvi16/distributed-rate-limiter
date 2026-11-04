@@ -1,6 +1,6 @@
 # Performance Benchmarking and Scalability Evaluation Report
 
-**Generated:** 2026-11-04 09:24:37 UTC  
+**Generated:** 2026-11-04 11:48:58 UTC  
 **Target System:** Distributed Rate Limiter (FastAPI + Redis Token Bucket + Gaussian Abuse Detection)  
 
 ---
@@ -32,12 +32,12 @@ Evaluated end-to-end HTTP requests over loopback to the `/limited-resource` endp
 
 | Concurrency (Clients) | Total Reqs | Throughput (RPS) | Mean Latency (ms) | P50 (ms) | P90 (ms) | P95 (ms) | P99 (ms) | Max Latency (ms) | Error Rate |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **1** | 200 | **0.8** | 1190.41 | 28.83 | 39.02 | 43.53 | 246.14 | 232571.26 | 0.0% |
-| **10** | 200 | **0.1** | 655.21 | 429.32 | 1562.57 | 1950.72 | 2965.19 | 3694.26 | 0.0% |
-| **50** | 200 | **20.9** | 1577.96 | 1232.66 | 3209.34 | 3910.93 | 5577.88 | 6771.54 | 0.0% |
-| **100** | 400 | **29.6** | 2526.82 | 2028.29 | 5417.03 | 6112.06 | 8812.89 | 10586.41 | 0.0% |
-| **250** | 1,000 | **43.2** | 4611.45 | 3948.33 | 9754.12 | 13075.76 | 18401.21 | 20865.42 | 0.0% |
-| **500** | 2,000 | **40.5** | 10665.37 | 7667.85 | 24748.50 | 32116.08 | 41867.99 | 45909.63 | 0.1% |
+| **1** | 200 | **111.5** | 8.96 | 8.86 | 10.13 | 10.52 | 11.59 | 12.25 | 0.0% |
+| **10** | 200 | **123.8** | 79.72 | 49.41 | 149.35 | 290.10 | 376.37 | 572.99 | 0.0% |
+| **50** | 200 | **88.5** | 504.61 | 403.85 | 1134.55 | 1248.72 | 1828.46 | 1964.64 | 0.0% |
+| **100** | 400 | **61.3** | 1486.57 | 1100.89 | 3242.05 | 4336.07 | 6003.40 | 6222.84 | 0.0% |
+| **250** | 1,000 | **18.8** | 11638.69 | 8922.43 | 26150.81 | 32719.21 | 45022.51 | 52330.71 | 0.0% |
+| **500** | 2,000 | **21.0** | 21447.86 | 13952.26 | 51148.25 | 62399.03 | 86947.07 | 92970.73 | 0.1% |
 
 ### Concurrency Charts
 
@@ -53,9 +53,9 @@ Evaluated HTTP API scaling with Uvicorn worker process counts (1, 2, 4) at concu
 
 | Worker Processes | Concurrency | Total Reqs | Throughput (RPS) | Speedup vs 1 Worker | P50 Latency (ms) | P95 Latency (ms) | P99 Latency (ms) |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **1** | 50 | 500 | **45.7** | **1.00x** | 628.68 | 2121.57 | 3286.57 |
-| **2** | 50 | 500 | **57.5** | **1.26x** | 440.46 | 1863.82 | 2636.61 |
-| **4** | 50 | 500 | **65.7** | **1.44x** | 444.67 | 1481.00 | 2454.80 |
+| **1** | 50 | 500 | **79.6** | **1.00x** | 428.63 | 1674.21 | 2617.52 |
+| **2** | 50 | 500 | **85.0** | **1.07x** | 433.32 | 1554.48 | 2216.42 |
+| **4** | 50 | 500 | **66.5** | **0.83x** | 498.74 | 2096.25 | 3087.75 |
 
 ![Throughput vs Worker Count](charts/throughput_vs_workers.svg)
 
@@ -65,12 +65,12 @@ Directly measured the rate limiter engine core (`limiter.check_limit`) isolating
 
 | Test Scenario | Description | Throughput (RPS) | P50 (ms) | P95 (ms) | P99 (ms) | Allowed | Rejected |
 |:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **behavior_within_limit** | Requests within configured burst capacity (allowed=True) | **1,774.9** | 17.805 | 25.583 | 554.691 | 1,000 | 0 |
-| **behavior_exceeding_limit** | Requests exceeding bucket capacity (allowed=False fast-path) | **950.1** | 51.134 | 70.382 | 80.471 | 1 | 999 |
-| **behavior_multiple_users** | 50 distinct user keys concurrently evaluating limits in Redis | **1,507.6** | 33.016 | 41.465 | 43.716 | 1,000 | 0 |
-| **behavior_config_high_burst** | High burst (capacity=1000, refill=1/s) | **1,353.7** | 37.523 | 40.554 | 41.358 | 1,000 | 0 |
-| **behavior_config_sustained_refill** | Sustained refill (capacity=10, refill=100/s) | **1,180.0** | 42.753 | 49.331 | 51.461 | 1,000 | 0 |
-| **behavior_same_user_contention** | High contention against single hot key in Redis | **1,006.7** | 48.125 | 75.408 | 79.265 | 1,000 | 0 |
+| **behavior_within_limit** | Requests within configured burst capacity (allowed=True) | **1,094.7** | 27.747 | 34.428 | 663.033 | 1,000 | 0 |
+| **behavior_exceeding_limit** | Requests exceeding bucket capacity (allowed=False fast-path) | **1,082.3** | 39.838 | 70.905 | 73.079 | 1 | 999 |
+| **behavior_multiple_users** | 50 distinct user keys concurrently evaluating limits in Redis | **1,126.3** | 39.747 | 54.964 | 59.649 | 1,000 | 0 |
+| **behavior_config_high_burst** | High burst (capacity=1000, refill=1/s) | **1,270.9** | 37.399 | 41.921 | 43.210 | 1,000 | 0 |
+| **behavior_config_sustained_refill** | Sustained refill (capacity=10, refill=100/s) | **870.6** | 57.047 | 88.204 | 98.939 | 1,000 | 0 |
+| **behavior_same_user_contention** | High contention against single hot key in Redis | **1,386.5** | 33.020 | 39.843 | 41.935 | 1,000 | 0 |
 
 > [!NOTE]
 > When rate limit capacity is exhausted, the Lua script executes an early-exit branch without resetting accumulated timestamp counters, completing faster than successful deductions.
@@ -79,11 +79,11 @@ Directly measured the rate limiter engine core (`limiter.check_limit`) isolating
 
 | Strategy / State | Operational Behavior | Throughput (RPS) | P50 (ms) | Status Breakdown |
 |:---|:---|:---:|:---:|:---|
-| **failure_mode_redis_available** | Normal operation with Redis online | **1,223.4** | 16.311 | `200: 500` |
-| **failure_mode_fail_closed** | Redis down under FAIL_CLOSED (fast-path rejection) | **3,256,692.5** | 0.004 | `503: 500` |
-| **failure_mode_fail_open** | Redis down under FAIL_OPEN (graceful allow) | **4,570,383.9** | 0.004 | `200: 500` |
-| **failure_mode_local_fallback** | Redis down under LOCAL_FALLBACK (in-memory token bucket) | **4,911,108.3** | 0.004 | `200: 500` |
-| **failure_mode_redis_recovery** | Redis reconnected and restored to normal operation | **1,417.2** | 13.341 | `200: 500` |
+| **failure_mode_redis_available** | Normal operation with Redis online | **1,256.8** | 15.437 | `200: 500` |
+| **failure_mode_fail_closed** | Redis down under FAIL_CLOSED (fast-path rejection via 503) | **114,009.5** | 0.004 | `503: 500` |
+| **failure_mode_fail_open** | Redis down under FAIL_OPEN (graceful allow via 200) | **100,311.0** | 0.005 | `200: 500` |
+| **failure_mode_local_fallback** | Redis down under LOCAL_FALLBACK (in-memory token bucket) | **88,728.0** | 0.005 | `200: 500` |
+| **failure_mode_redis_recovery** | Redis reconnected and restored to normal operation on the same instance | **1,243.4** | 15.564 | `200: 500` |
 
 > [!IMPORTANT]
 > Under `FAIL_CLOSED`, Redis reachability failures immediately fail closed with HTTP 503, strictly safeguarding quota integrity against DDoS or infrastructure partition. Under `LOCAL_FALLBACK`, traffic continues without interruption using in-memory token buckets.
@@ -92,8 +92,8 @@ Directly measured the rate limiter engine core (`limiter.check_limit`) isolating
 
 | Architecture Mode | Consistency Guarantee | Sharing Scope | Throughput (RPS) | P50 Latency (ms) | P99 Latency (ms) |
 |:---|:---|:---|:---:|:---:|:---:|
-| **comparison_local_in_memory** | `process_local` | `none (isolated per process)` | **9,907,366.6** | **0.004** | 0.016 |
-| **comparison_redis_distributed** | `cluster_wide_atomic` | `synchronized across all nodes & workers` | **1,073.1** | **46.420** | 94.842 |
+| **comparison_local_in_memory** | `process_local` | `none (isolated per process)` | **121,514.8** | **0.004** | 0.014 |
+| **comparison_redis_distributed** | `cluster_wide_atomic` | `synchronized across all nodes & workers` | **1,209.7** | **36.741** | 83.495 |
 
 ![Local vs Redis Performance](charts/local_vs_redis.svg)
 

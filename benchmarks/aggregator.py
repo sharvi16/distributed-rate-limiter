@@ -109,14 +109,46 @@ class BenchmarkResult:
         redis_latencies_ms: Optional[List[float]] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> "BenchmarkResult":
-        total_reqs = sum(status_codes.values()) + error_count
-        dur = max(duration_seconds, 0.0001)
-        rps = total_reqs / dur
+        # 1. Non-zero, finite duration validation
+        if not isinstance(duration_seconds, (int, float)) or not math.isfinite(duration_seconds) or duration_seconds <= 0:
+            raise ValueError(f"duration_seconds must be a positive finite number, got {duration_seconds!r}")
 
+        # 2. Total request calculation and non-negative check
+        if error_count < 0:
+            raise ValueError(f"error_count cannot be negative, got {error_count}")
+        for code, count in status_codes.items():
+            if count < 0:
+                raise ValueError(f"status code count cannot be negative for code {code}: {count}")
+
+        total_reqs = sum(status_codes.values()) + error_count
+
+        # 3. Safe zero-request handling & latency sample count validation
+        if total_reqs == 0:
+            if latencies_ms:
+                raise ValueError(f"latencies_ms must be empty when total_requests is 0, got {len(latencies_ms)} samples")
+            rps = 0.0
+            err_rate = 0.0
+        else:
+            if len(latencies_ms) != total_reqs:
+                raise ValueError(
+                    f"Latency sample count mismatch: got {len(latencies_ms)} latency samples for {total_reqs} total requests "
+                    f"(status_codes sum={sum(status_codes.values())}, error_count={error_count})"
+                )
+            rps = total_reqs / duration_seconds
+
+        # 4. Strict request categorization
         success = status_codes.get(200, 0)
         rate_limited = status_codes.get(429, 0)
         challenge = status_codes.get(403, 0)
-        errs = error_count + sum(count for code, count in status_codes.items() if code >= 500)
+        # All non-200/403/429 status codes (e.g. 5xx, 4xx) plus transport connection errors
+        errs = error_count + sum(count for code, count in status_codes.items() if code not in (200, 403, 429))
+
+        # 5. Strict consistency invariant check
+        if total_reqs != (success + rate_limited + challenge + errs):
+            raise ValueError(
+                f"Inconsistent request accounting: total ({total_reqs}) != "
+                f"success ({success}) + rate_limited ({rate_limited}) + challenge ({challenge}) + errors ({errs})"
+            )
 
         err_rate = (errs / total_reqs * 100.0) if total_reqs > 0 else 0.0
 
@@ -127,7 +159,7 @@ class BenchmarkResult:
             scenario_name=scenario_name,
             concurrency=concurrency,
             workers=workers,
-            duration_seconds=round(dur, 3),
+            duration_seconds=round(float(duration_seconds), 3),
             total_requests=total_reqs,
             successful_requests=success,
             rate_limited_requests=rate_limited,
@@ -197,3 +229,4 @@ class ResultAggregator:
                     "max_latency_ms": r.latency.max_ms
                 })
         return target
+

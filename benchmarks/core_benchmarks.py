@@ -4,6 +4,7 @@ Evaluates Redis Lua atomicity, local fallback, failure modes, contention, and ca
 """
 
 import concurrent.futures
+import threading
 import time
 from typing import List, Dict, Tuple, Optional, Any
 import redis
@@ -11,6 +12,58 @@ import redis
 from rate_limiter import RateLimiter, FailureMode, RedisUnavailableError
 from benchmarks.config import BenchmarkConfig
 from benchmarks.aggregator import BenchmarkResult
+
+
+class FaultInjectableRedisClient:
+    """
+    Thread-safe Redis client wrapper capable of dynamically injecting network outages
+    and connection drops on an active RateLimiter instance without replacing the instance.
+    """
+
+    def __init__(self, target_client: redis.Redis):
+        self._target = target_client
+        self._fault = False
+        self._lock = threading.Lock()
+
+    def set_fault(self, fault: bool) -> None:
+        with self._lock:
+            self._fault = fault
+
+    @property
+    def is_fault(self) -> bool:
+        with self._lock:
+            return self._fault
+
+    def register_script(self, script_str: str):
+        real_script = self._target.register_script(script_str)
+
+        def _script_caller(*args, **kwargs):
+            with self._lock:
+                if self._fault:
+                    raise redis.ConnectionError("Connection refused: host unreachable (simulated outage)")
+            return real_script(*args, **kwargs)
+
+        return _script_caller
+
+    def ping(self, *args, **kwargs):
+        with self._lock:
+            if self._fault:
+                raise redis.ConnectionError("Connection refused: host unreachable (simulated outage)")
+        return self._target.ping(*args, **kwargs)
+
+    def verify_connection(self, timeout: float = 1.0) -> bool:
+        with self._lock:
+            if self._fault:
+                raise redis.ConnectionError("Connection refused: host unreachable (simulated outage)")
+        if hasattr(self._target, "verify_connection"):
+            return self._target.verify_connection(timeout=timeout)
+        return bool(self._target.ping())
+
+    def __getattr__(self, name: str) -> Any:
+        with self._lock:
+            if self._fault:
+                raise redis.ConnectionError("Connection refused: host unreachable (simulated outage)")
+        return getattr(self._target, name)
 
 
 def benchmark_rate_limiter_behavior(
@@ -35,16 +88,17 @@ def benchmark_rate_limiter_behavior(
 
     # 1. Within Limit (Capacity = 100,000)
     lim_within = RateLimiter(redis_client=redis_client, capacity=100000.0, refill_rate=1000.0)
-    latencies_within, status_within = _run_engine_load(
+    lat_within, st_within, err_within, dur_within = _run_engine_load(
         lim_within, concurrency=concurrency, total_requests=total_reqs, user_prefix="user_within", distinct=True
     )
     r1 = BenchmarkResult.create(
         scenario_name="behavior_within_limit",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(latencies_within) / 1000.0 / concurrency,
-        latencies_ms=latencies_within,
-        status_codes=status_within,
+        duration_seconds=dur_within,
+        latencies_ms=lat_within,
+        status_codes=st_within,
+        error_count=err_within,
         metadata={"description": "Requests within configured burst capacity (allowed=True)"}
     )
     results.append(r1)
@@ -54,16 +108,17 @@ def benchmark_rate_limiter_behavior(
     lim_exceed = RateLimiter(redis_client=redis_client, capacity=1.0, refill_rate=0.001)
     # Prime bucket to empty
     lim_exceed.check_limit("user_exhausted", tokens=1.0)
-    latencies_exceed, status_exceed = _run_engine_load(
+    lat_exceed, st_exceed, err_exceed, dur_exceed = _run_engine_load(
         lim_exceed, concurrency=concurrency, total_requests=total_reqs, user_prefix="user_exhausted", distinct=False
     )
     r2 = BenchmarkResult.create(
         scenario_name="behavior_exceeding_limit",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(latencies_exceed) / 1000.0 / concurrency,
-        latencies_ms=latencies_exceed,
-        status_codes=status_exceed,
+        duration_seconds=dur_exceed,
+        latencies_ms=lat_exceed,
+        status_codes=st_exceed,
+        error_count=err_exceed,
         metadata={"description": "Requests exceeding bucket capacity (allowed=False fast-path)"}
     )
     results.append(r2)
@@ -71,16 +126,17 @@ def benchmark_rate_limiter_behavior(
 
     # 3. Multiple Users Sharing Redis (50 distinct keys)
     lim_multi = RateLimiter(redis_client=redis_client, capacity=10000.0, refill_rate=100.0)
-    latencies_multi, status_multi = _run_engine_load(
+    lat_multi, st_multi, err_multi, dur_multi = _run_engine_load(
         lim_multi, concurrency=concurrency, total_requests=total_reqs, user_prefix="multi_user", distinct=True
     )
     r3 = BenchmarkResult.create(
         scenario_name="behavior_multiple_users",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(latencies_multi) / 1000.0 / concurrency,
-        latencies_ms=latencies_multi,
-        status_codes=status_multi,
+        duration_seconds=dur_multi,
+        latencies_ms=lat_multi,
+        status_codes=st_multi,
+        error_count=err_multi,
         metadata={"description": "50 distinct user keys concurrently evaluating limits in Redis"}
     )
     results.append(r3)
@@ -88,31 +144,33 @@ def benchmark_rate_limiter_behavior(
 
     # 4. Token Bucket Configurations: High Burst vs Sustained Refill
     lim_high_burst = RateLimiter(redis_client=redis_client, capacity=1000.0, refill_rate=1.0)
-    latencies_hb, status_hb = _run_engine_load(
+    lat_hb, st_hb, err_hb, dur_hb = _run_engine_load(
         lim_high_burst, concurrency=concurrency, total_requests=total_reqs, user_prefix="high_burst", distinct=True
     )
     r4 = BenchmarkResult.create(
         scenario_name="behavior_config_high_burst",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(latencies_hb) / 1000.0 / concurrency,
-        latencies_ms=latencies_hb,
-        status_codes=status_hb,
+        duration_seconds=dur_hb,
+        latencies_ms=lat_hb,
+        status_codes=st_hb,
+        error_count=err_hb,
         metadata={"description": "High burst (capacity=1000, refill=1/s)"}
     )
     results.append(r4)
 
     lim_sustained = RateLimiter(redis_client=redis_client, capacity=10.0, refill_rate=100.0)
-    latencies_sust, status_sust = _run_engine_load(
+    lat_sust, st_sust, err_sust, dur_sust = _run_engine_load(
         lim_sustained, concurrency=concurrency, total_requests=total_reqs, user_prefix="sustained", distinct=True
     )
     r5 = BenchmarkResult.create(
         scenario_name="behavior_config_sustained_refill",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(latencies_sust) / 1000.0 / concurrency,
-        latencies_ms=latencies_sust,
-        status_codes=status_sust,
+        duration_seconds=dur_sust,
+        latencies_ms=lat_sust,
+        status_codes=st_sust,
+        error_count=err_sust,
         metadata={"description": "Sustained refill (capacity=10, refill=100/s)"}
     )
     results.append(r5)
@@ -121,16 +179,17 @@ def benchmark_rate_limiter_behavior(
 
     # 5. Concurrent Requests Against Same User (Single Key Contention)
     lim_contend = RateLimiter(redis_client=redis_client, capacity=100000.0, refill_rate=10000.0)
-    latencies_contend, status_contend = _run_engine_load(
+    lat_contend, st_contend, err_contend, dur_contend = _run_engine_load(
         lim_contend, concurrency=concurrency, total_requests=total_reqs, user_prefix="single_hotspot_key", distinct=False
     )
     r6 = BenchmarkResult.create(
         scenario_name="behavior_same_user_contention",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(latencies_contend) / 1000.0 / concurrency,
-        latencies_ms=latencies_contend,
-        status_codes=status_contend,
+        duration_seconds=dur_contend,
+        latencies_ms=lat_contend,
+        status_codes=st_contend,
+        error_count=err_contend,
         metadata={"description": "High contention against single hot key in Redis"}
     )
     results.append(r6)
@@ -144,104 +203,130 @@ def benchmark_redis_failure_scenarios(
     redis_client: redis.Redis
 ) -> List[BenchmarkResult]:
     """
-    Scenario D: Evaluates rate limiter behavior under Redis availability, outage, and recovery:
-      1. Baseline: Redis Available
+    Scenario D: Evaluates rate limiter behavior under Redis availability, outage, and recovery
+    using the EXACT SAME RateLimiter instance throughout all phases:
+      1. Baseline: Redis Available (FAIL_CLOSED)
       2. Outage under FAIL_CLOSED: Rejects requests immediately (503 / RedisUnavailableError)
       3. Outage under FAIL_OPEN: Allows requests (200 pass-through)
       4. Outage under LOCAL_FALLBACK: Falls back to in-memory Token Bucket
-      5. Recovery: Redis connectivity restored, measuring recovery latency
+      5. Recovery: Redis connectivity restored on the same instance, measuring recovery latency
     """
     results: List[BenchmarkResult] = []
     total_reqs = max(config.requests_per_test // 2, 500)
     concurrency = min(config.default_concurrency, 20)
 
     print("\n" + "=" * 70)
-    print(" SCENARIO D: Redis Failure, Fallback & Recovery Scenarios")
+    print(" SCENARIO D: Redis Failure, Fallback & Same-Instance Recovery")
     print("=" * 70)
 
+    fault_client = FaultInjectableRedisClient(redis_client)
+    limiter = RateLimiter(
+        redis_client=fault_client,
+        capacity=10000.0,
+        refill_rate=100.0,
+        failure_mode=FailureMode.FAIL_CLOSED
+    )
+
     # 1. Baseline: Redis Available
-    lim_online = RateLimiter(redis_client=redis_client, capacity=10000.0, refill_rate=100.0, failure_mode=FailureMode.FAIL_CLOSED)
-    lat_online, st_online = _run_engine_load(lim_online, concurrency, total_reqs, "redis_online")
+    fault_client.set_fault(False)
+    lat_online, st_online, err_online, dur_online = _run_engine_load(
+        limiter, concurrency, total_reqs, "redis_online"
+    )
     r1 = BenchmarkResult.create(
         scenario_name="failure_mode_redis_available",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(lat_online) / 1000.0 / concurrency,
+        duration_seconds=dur_online,
         latencies_ms=lat_online,
         status_codes=st_online,
+        error_count=err_online,
         metadata={"description": "Normal operation with Redis online"}
     )
     results.append(r1)
     print(f" -> Baseline (Online):    RPS: {r1.requests_per_second:8.1f} | p50: {r1.latency.p50_ms:6.2f}ms | Status: {st_online}")
 
-    # Simulated Offline Redis client
-    class OfflineRedisMock:
-        def register_script(self, script):
-            raise redis.ConnectionError("Redis connection refused (simulated outage)")
-        def ping(self, timeout=None):
-            raise redis.ConnectionError("Redis connection refused")
-
-    offline_mock = OfflineRedisMock()
-
     # 2. FAIL_CLOSED Outage
-    lim_fc = RateLimiter(redis_client=offline_mock, capacity=10000.0, refill_rate=100.0, failure_mode=FailureMode.FAIL_CLOSED)
-    lat_fc, st_fc = _run_engine_load(lim_fc, concurrency, total_reqs, "redis_down_fc")
+    fault_client.set_fault(True)
+    lat_fc, st_fc, err_fc, dur_fc = _run_engine_load(
+        limiter, concurrency, total_reqs, "redis_down_fc"
+    )
     r2 = BenchmarkResult.create(
         scenario_name="failure_mode_fail_closed",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(lat_fc) / 1000.0 / concurrency,
+        duration_seconds=dur_fc,
         latencies_ms=lat_fc,
         status_codes=st_fc,
-        metadata={"description": "Redis down under FAIL_CLOSED (fast-path rejection)"}
+        error_count=err_fc,
+        metadata={"description": "Redis down under FAIL_CLOSED (fast-path rejection via 503)"}
     )
     results.append(r2)
     print(f" -> Outage FAIL_CLOSED:   RPS: {r2.requests_per_second:8.1f} | p50: {r2.latency.p50_ms:6.2f}ms | 503 Errors: {st_fc.get(503, 0)}")
 
-    # 3. FAIL_OPEN Outage
-    lim_fo = RateLimiter(redis_client=offline_mock, capacity=10000.0, refill_rate=100.0, failure_mode=FailureMode.FAIL_OPEN)
-    lat_fo, st_fo = _run_engine_load(lim_fo, concurrency, total_reqs, "redis_down_fo")
+    # 3. FAIL_OPEN Outage (on the same limiter instance)
+    limiter.configure(failure_mode=FailureMode.FAIL_OPEN)
+    lat_fo, st_fo, err_fo, dur_fo = _run_engine_load(
+        limiter, concurrency, total_reqs, "redis_down_fo"
+    )
     r3 = BenchmarkResult.create(
         scenario_name="failure_mode_fail_open",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(lat_fo) / 1000.0 / concurrency,
+        duration_seconds=dur_fo,
         latencies_ms=lat_fo,
         status_codes=st_fo,
-        metadata={"description": "Redis down under FAIL_OPEN (graceful allow)"}
+        error_count=err_fo,
+        metadata={"description": "Redis down under FAIL_OPEN (graceful allow via 200)"}
     )
     results.append(r3)
     print(f" -> Outage FAIL_OPEN:     RPS: {r3.requests_per_second:8.1f} | p50: {r3.latency.p50_ms:6.2f}ms | Allowed: {st_fo.get(200, 0)}")
 
-    # 4. LOCAL_FALLBACK Outage
-    lim_fb = RateLimiter(redis_client=offline_mock, capacity=10000.0, refill_rate=100.0, failure_mode=FailureMode.LOCAL_FALLBACK)
-    lat_fb, st_fb = _run_engine_load(lim_fb, concurrency, total_reqs, "redis_down_fb")
+    # 4. LOCAL_FALLBACK Outage (on the same limiter instance)
+    limiter.configure(failure_mode=FailureMode.LOCAL_FALLBACK)
+    lat_fb, st_fb, err_fb, dur_fb = _run_engine_load(
+        limiter, concurrency, total_reqs, "redis_down_fb"
+    )
     r4 = BenchmarkResult.create(
         scenario_name="failure_mode_local_fallback",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(lat_fb) / 1000.0 / concurrency,
+        duration_seconds=dur_fb,
         latencies_ms=lat_fb,
         status_codes=st_fb,
+        error_count=err_fb,
         metadata={"description": "Redis down under LOCAL_FALLBACK (in-memory token bucket)"}
     )
     results.append(r4)
     print(f" -> Outage LOCAL_FALLBACK:RPS: {r4.requests_per_second:8.1f} | p50: {r4.latency.p50_ms:6.2f}ms | Allowed: {st_fb.get(200, 0)}")
 
-    # 5. Recovery Phase: Reconnect back to online Redis
-    lim_recovered = RateLimiter(redis_client=redis_client, capacity=10000.0, refill_rate=100.0, failure_mode=FailureMode.FAIL_CLOSED)
-    lat_rec, st_rec = _run_engine_load(lim_recovered, concurrency, total_reqs, "redis_recovered")
+    # 5. Recovery Phase: Restore Redis connectivity on the same instance
+    fault_client.set_fault(False)
+    limiter.configure(failure_mode=FailureMode.FAIL_CLOSED)
+
+    # Measure time to first successful request (recovery probe latency)
+    t_probe = time.perf_counter()
+    first_res = limiter.check_limit("recovery_probe_user", tokens=1.0)
+    probe_latency_ms = (time.perf_counter() - t_probe) * 1000.0
+
+    lat_rec, st_rec, err_rec, dur_rec = _run_engine_load(
+        limiter, concurrency, total_reqs, "redis_recovered"
+    )
     r5 = BenchmarkResult.create(
         scenario_name="failure_mode_redis_recovery",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(lat_rec) / 1000.0 / concurrency,
+        duration_seconds=dur_rec,
         latencies_ms=lat_rec,
         status_codes=st_rec,
-        metadata={"description": "Redis reconnected and restored to normal operation"}
+        error_count=err_rec,
+        metadata={
+            "description": "Redis reconnected and restored to normal operation on the same instance",
+            "first_request_allowed": first_res.allowed,
+            "recovery_probe_latency_ms": round(probe_latency_ms, 3)
+        }
     )
     results.append(r5)
-    print(f" -> Restored / Recovery:  RPS: {r5.requests_per_second:8.1f} | p50: {r5.latency.p50_ms:6.2f}ms | Allowed: {st_rec.get(200, 0)}")
+    print(f" -> Restored / Recovery:  RPS: {r5.requests_per_second:8.1f} | p50: {r5.latency.p50_ms:6.2f}ms | Allowed: {st_rec.get(200, 0)} | Probe: {probe_latency_ms:.2f}ms")
 
     return results
 
@@ -266,14 +351,17 @@ def benchmark_local_vs_distributed(
     lim_local = RateLimiter(redis_client=None, capacity=100000.0, refill_rate=10000.0, failure_mode=FailureMode.LOCAL_FALLBACK)
     lim_local.redis = None
     lim_local.check_limit_script = None
-    lat_local, st_local = _run_engine_load(lim_local, concurrency, total_reqs, "pure_local", distinct=True)
+    lat_local, st_local, err_local, dur_local = _run_engine_load(
+        lim_local, concurrency, total_reqs, "pure_local", distinct=True
+    )
     r_local = BenchmarkResult.create(
         scenario_name="comparison_local_in_memory",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(lat_local) / 1000.0 / concurrency,
+        duration_seconds=dur_local,
         latencies_ms=lat_local,
         status_codes=st_local,
+        error_count=err_local,
         metadata={
             "mode": "local_in_memory",
             "consistency": "process_local",
@@ -286,14 +374,17 @@ def benchmark_local_vs_distributed(
 
     # 2. Redis-Backed Distributed Limiting
     lim_dist = RateLimiter(redis_client=redis_client, capacity=100000.0, refill_rate=10000.0, failure_mode=FailureMode.FAIL_CLOSED)
-    lat_dist, st_dist = _run_engine_load(lim_dist, concurrency, total_reqs, "redis_dist", distinct=True)
+    lat_dist, st_dist, err_dist, dur_dist = _run_engine_load(
+        lim_dist, concurrency, total_reqs, "redis_dist", distinct=True
+    )
     r_dist = BenchmarkResult.create(
         scenario_name="comparison_redis_distributed",
         concurrency=concurrency,
         workers=1,
-        duration_seconds=sum(lat_dist) / 1000.0 / concurrency,
+        duration_seconds=dur_dist,
         latencies_ms=lat_dist,
         status_codes=st_dist,
+        error_count=err_dist,
         redis_latencies_ms=lat_dist,  # Direct Redis Lua execution time
         metadata={
             "mode": "redis_distributed",
@@ -322,23 +413,30 @@ def _run_engine_load(
     total_requests: int,
     user_prefix: str,
     distinct: bool = True
-) -> Tuple[List[float], Dict[int, int]]:
+) -> Tuple[List[float], Dict[int, int], int, float]:
     """
-    Executes multi-threaded load directly against a RateLimiter instance
-    measuring pure rate limiter check_limit() execution latency.
+    Executes multi-threaded load directly against a RateLimiter instance,
+    measuring pure rate limiter check_limit() execution latency and true wall-clock time.
+    Returns: (latencies_ms, status_codes, error_count, elapsed_seconds)
     """
     latencies_ms: List[float] = []
     status_codes: Dict[int, int] = {}
+    error_count: int = 0
     user_count = concurrency if distinct else 1
     users = [f"{user_prefix}_{i}" for i in range(user_count)]
-    reqs_per_worker = total_requests // concurrency
 
-    def worker_fn(worker_idx: int) -> Tuple[List[float], Dict[int, int]]:
+    # Exact request distribution across workers to prevent remainder truncation
+    base_reqs = total_requests // concurrency
+    remainder = total_requests % concurrency
+    reqs_per_worker = [base_reqs + (1 if i < remainder else 0) for i in range(concurrency)]
+
+    def worker_fn(worker_idx: int, num_reqs: int) -> Tuple[List[float], Dict[int, int], int]:
         w_lats = []
         w_stats = {}
+        w_errs = 0
         u = users[worker_idx % len(users)]
 
-        for _ in range(reqs_per_worker):
+        for _ in range(num_reqs):
             t0 = time.perf_counter()
             try:
                 res = limiter.check_limit(u, tokens=1.0)
@@ -355,14 +453,17 @@ def _run_engine_load(
                 w_lats.append(elapsed_ms)
                 w_stats[500] = w_stats.get(500, 0) + 1
 
-        return w_lats, w_stats
+        return w_lats, w_stats, w_errs
 
+    t_start = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(worker_fn, i) for i in range(concurrency)]
+        futures = [executor.submit(worker_fn, i, reqs_per_worker[i]) for i in range(concurrency)]
         for f in concurrent.futures.as_completed(futures):
-            lats, stats = f.result()
+            lats, stats, errs = f.result()
             latencies_ms.extend(lats)
             for code, cnt in stats.items():
                 status_codes[code] = status_codes.get(code, 0) + cnt
+            error_count += errs
+    elapsed_seconds = max(time.perf_counter() - t_start, 0.0001)
 
-    return latencies_ms, status_codes
+    return latencies_ms, status_codes, error_count, elapsed_seconds
