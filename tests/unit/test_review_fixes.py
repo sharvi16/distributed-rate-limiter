@@ -3,7 +3,9 @@ Unit and regression tests verifying all fixes for the code review follow-up.
 """
 
 import math
+import threading
 import time
+from typing import Optional
 import uuid
 import pytest
 from unittest.mock import MagicMock, patch
@@ -161,7 +163,12 @@ def test_challenge_generation_per_user_throttle_redis():
     [1, -5.0],
     ["invalid", 5.0],
     123,
-    {"allowed": 1, "remaining": 5}
+    {"allowed": 1, "remaining": 5},
+    [True, 5.0],
+    [False, 5.0],
+    [1, 15.0],             # Remaining exceeds bucket capacity (10)
+    [1, 5.0, "extra"],     # Unexpected extra element (len > 2)
+    [1, 5.0, 0]            # Unexpected extra element (len > 2)
 ])
 def test_check_limit_handles_all_malformed_lua_responses(bad_result):
     """check_limit routes any malformed Lua response to failure handler across all 3 failure modes."""
@@ -187,6 +194,89 @@ def test_check_limit_handles_all_malformed_lua_responses(bad_result):
     with pytest.raises(RedisUnavailableError) as exc_info:
         lim_closed.check_limit("user_fc_bad")
     assert "Rate limiter service unavailable" in str(exc_info.value)
+
+
+def test_check_limit_rejects_boolean_allowed_indicator_across_modes():
+    """check_limit strictly rejects booleans for allowed indicator (True/False) across all failure modes."""
+    for bool_allowed in [True, False]:
+        bad_response = [bool_allowed, 5.0]
+
+        # FAIL_CLOSED
+        lim_closed = RateLimiter(capacity=10, refill_rate=1.0, failure_mode=FailureMode.FAIL_CLOSED)
+        lim_closed.redis = MagicMock()
+        lim_closed.check_limit_script = MagicMock(return_value=bad_response)
+        with pytest.raises(RedisUnavailableError) as exc_info:
+            lim_closed.check_limit("user_bool_allowed")
+        assert "invalid allowed indicator" in str(exc_info.value)
+
+        # FAIL_OPEN
+        lim_open = RateLimiter(capacity=10, refill_rate=1.0, failure_mode=FailureMode.FAIL_OPEN)
+        lim_open.redis = MagicMock()
+        lim_open.check_limit_script = MagicMock(return_value=bad_response)
+        res_open = lim_open.check_limit("user_bool_allowed")
+        assert res_open.allowed is True
+
+        # LOCAL_FALLBACK
+        lim_fallback = RateLimiter(capacity=10, refill_rate=1.0, failure_mode=FailureMode.LOCAL_FALLBACK)
+        lim_fallback.redis = MagicMock()
+        lim_fallback.check_limit_script = MagicMock(return_value=bad_response)
+        res_fallback = lim_fallback.check_limit("user_bool_allowed")
+        assert res_fallback.allowed is True
+
+
+def test_check_limit_rejects_remaining_exceeding_capacity_across_modes():
+    """check_limit rejects remaining tokens exceeding configured bucket capacity across all failure modes."""
+    capacity = 10
+    excessive_remaining = capacity + 5.0  # 15.0 > 10.0
+    bad_response = [1, excessive_remaining]
+
+    # FAIL_CLOSED
+    lim_closed = RateLimiter(capacity=capacity, refill_rate=1.0, failure_mode=FailureMode.FAIL_CLOSED)
+    lim_closed.redis = MagicMock()
+    lim_closed.check_limit_script = MagicMock(return_value=bad_response)
+    with pytest.raises(RedisUnavailableError) as exc_info:
+        lim_closed.check_limit("user_excessive_tokens")
+    assert "cannot exceed bucket capacity" in str(exc_info.value)
+
+    # FAIL_OPEN
+    lim_open = RateLimiter(capacity=capacity, refill_rate=1.0, failure_mode=FailureMode.FAIL_OPEN)
+    lim_open.redis = MagicMock()
+    lim_open.check_limit_script = MagicMock(return_value=bad_response)
+    res_open = lim_open.check_limit("user_excessive_tokens")
+    assert res_open.allowed is True
+
+    # LOCAL_FALLBACK
+    lim_fallback = RateLimiter(capacity=capacity, refill_rate=1.0, failure_mode=FailureMode.LOCAL_FALLBACK)
+    lim_fallback.redis = MagicMock()
+    lim_fallback.check_limit_script = MagicMock(return_value=bad_response)
+    res_fallback = lim_fallback.check_limit("user_excessive_tokens")
+    assert res_fallback.allowed is True
+
+
+def test_check_limit_rejects_unexpected_extra_elements_across_modes():
+    """check_limit strictly enforces exact sequence length of 2 across all failure modes."""
+    for bad_response in [[1, 5.0, "extra"], [1, 5.0, 0], [1, 5.0, None, "unexpected"]]:
+        # FAIL_CLOSED
+        lim_closed = RateLimiter(capacity=10, refill_rate=1.0, failure_mode=FailureMode.FAIL_CLOSED)
+        lim_closed.redis = MagicMock()
+        lim_closed.check_limit_script = MagicMock(return_value=bad_response)
+        with pytest.raises(RedisUnavailableError) as exc_info:
+            lim_closed.check_limit("user_extra_elements")
+        assert "expected sequence of exactly 2 elements" in str(exc_info.value)
+
+        # FAIL_OPEN
+        lim_open = RateLimiter(capacity=10, refill_rate=1.0, failure_mode=FailureMode.FAIL_OPEN)
+        lim_open.redis = MagicMock()
+        lim_open.check_limit_script = MagicMock(return_value=bad_response)
+        res_open = lim_open.check_limit("user_extra_elements")
+        assert res_open.allowed is True
+
+        # LOCAL_FALLBACK
+        lim_fallback = RateLimiter(capacity=10, refill_rate=1.0, failure_mode=FailureMode.LOCAL_FALLBACK)
+        lim_fallback.redis = MagicMock()
+        lim_fallback.check_limit_script = MagicMock(return_value=bad_response)
+        res_fallback = lim_fallback.check_limit("user_extra_elements")
+        assert res_fallback.allowed is True
 
 
 # =============================================================================
@@ -369,14 +459,16 @@ def test_init_or_load_redis_model_uses_direct_hset():
 # Priority 4: Bounded verify_connection for client without connection pool
 # =============================================================================
 
-class MockNoPoolRedisClient:
-    """Simulates a custom Redis client without a connection_pool attribute."""
+class MockTimeoutCapableRedisClient:
+    """Simulates a custom Redis client without connection_pool that provides a timeout-capable ping."""
     def __init__(self, delay: float = 0.0, should_fail: bool = False):
         self.connection_pool = None
         self.delay = delay
         self.should_fail = should_fail
 
-    def ping(self):
+    def ping(self, timeout: Optional[float] = None):
+        if timeout is not None and self.delay > timeout:
+            raise TimeoutError(f"Redis connectivity check timed out after {timeout}s")
         if self.delay > 0:
             time.sleep(self.delay)
         if self.should_fail:
@@ -384,9 +476,30 @@ class MockNoPoolRedisClient:
         return True
 
 
+class MockNonTimeoutCapableRedisClient:
+    """Simulates a custom Redis client without connection_pool whose ping() does not accept timeout."""
+    def __init__(self):
+        self.connection_pool = None
+
+    def ping(self):
+        return True
+
+
+class MockVerifyConnectionCapableRedisClient:
+    """Simulates a custom Redis client implementing its own bounded verify_connection method."""
+    def __init__(self, succeeds: bool = True):
+        self.connection_pool = None
+        self.succeeds = succeeds
+
+    def verify_connection(self, timeout: float = 1.0) -> bool:
+        if not self.succeeds:
+            raise TimeoutError(f"Custom verify_connection timed out after {timeout}s")
+        return True
+
+
 def test_verify_connection_without_connection_pool_fast_success():
     """verify_connection succeeds quickly for a client without a connection pool."""
-    client = MockNoPoolRedisClient(delay=0.0)
+    client = MockTimeoutCapableRedisClient(delay=0.0)
     limiter = RateLimiter(
         redis_client=client,
         failure_mode=FailureMode.FAIL_CLOSED
@@ -397,7 +510,7 @@ def test_verify_connection_without_connection_pool_fast_success():
 def test_verify_connection_without_connection_pool_times_out():
     """verify_connection respects timeout bound even when client has no connection pool."""
     # Client blocks for 1.0s, but timeout is 0.05s
-    client = MockNoPoolRedisClient(delay=1.0)
+    client = MockTimeoutCapableRedisClient(delay=1.0)
 
     # 1. FAIL_CLOSED: raises RedisUnavailableError mentioning timeout
     limiter_closed = RateLimiter(
@@ -425,7 +538,7 @@ def test_verify_connection_without_connection_pool_times_out():
 
 def test_verify_connection_without_connection_pool_error_propagation():
     """verify_connection sanitizes and propagates errors from client without connection pool."""
-    client = MockNoPoolRedisClient(delay=0.0, should_fail=True)
+    client = MockTimeoutCapableRedisClient(delay=0.0, should_fail=True)
     limiter = RateLimiter(
         redis_client=client,
         failure_mode=FailureMode.FAIL_CLOSED
@@ -433,3 +546,69 @@ def test_verify_connection_without_connection_pool_error_propagation():
     with pytest.raises(RedisUnavailableError) as exc_info:
         limiter.verify_connection(timeout=0.5)
     assert "Custom connection failure" in str(exc_info.value)
+
+
+def test_verify_connection_without_connection_pool_repeated_timeouts_no_thread_accumulation():
+    """Repeated timed-out verify_connection calls without connection pool do not accumulate threads."""
+    client = MockTimeoutCapableRedisClient(delay=1.0)
+    limiter = RateLimiter(
+        redis_client=client,
+        failure_mode=FailureMode.FAIL_CLOSED
+    )
+
+    initial_threads = threading.active_count()
+
+    for _ in range(25):
+        with pytest.raises(RedisUnavailableError) as exc_info:
+            limiter.verify_connection(timeout=0.01)
+        assert "timed out after 0.01s" in str(exc_info.value)
+
+    # Strictly assert that zero threads leaked or accumulated
+    assert threading.active_count() <= initial_threads
+
+
+def test_verify_connection_without_connection_pool_fails_clearly_when_not_timeout_capable():
+    """verify_connection fails clearly when custom client lacks connection_pool and timeout-capable ping."""
+    client = MockNonTimeoutCapableRedisClient()
+
+    # 1. FAIL_CLOSED: raises RedisUnavailableError detailing the capability requirement
+    limiter_closed = RateLimiter(
+        redis_client=client,
+        failure_mode=FailureMode.FAIL_CLOSED
+    )
+    with pytest.raises(RedisUnavailableError) as exc_info:
+        limiter_closed.verify_connection(timeout=0.5)
+    assert "Bounded Redis connectivity check cannot be guaranteed" in str(exc_info.value)
+
+    # 2. FAIL_OPEN: returns False without raising
+    limiter_open = RateLimiter(
+        redis_client=client,
+        failure_mode=FailureMode.FAIL_OPEN
+    )
+    assert limiter_open.verify_connection(timeout=0.5) is False
+
+    # 3. LOCAL_FALLBACK: returns False without raising
+    limiter_fallback = RateLimiter(
+        redis_client=client,
+        failure_mode=FailureMode.LOCAL_FALLBACK
+    )
+    assert limiter_fallback.verify_connection(timeout=0.5) is False
+
+    # Verify no threads accumulated across repeated calls
+    initial_threads = threading.active_count()
+    for _ in range(15):
+        assert limiter_fallback.verify_connection(timeout=0.5) is False
+    assert threading.active_count() <= initial_threads
+
+
+def test_verify_connection_custom_client_verify_connection_interface():
+    """verify_connection supports custom clients providing their own verify_connection method."""
+    client_ok = MockVerifyConnectionCapableRedisClient(succeeds=True)
+    limiter_ok = RateLimiter(redis_client=client_ok, failure_mode=FailureMode.FAIL_CLOSED)
+    assert limiter_ok.verify_connection(timeout=0.5) is True
+
+    client_fail = MockVerifyConnectionCapableRedisClient(succeeds=False)
+    limiter_fail = RateLimiter(redis_client=client_fail, failure_mode=FailureMode.FAIL_CLOSED)
+    with pytest.raises(RedisUnavailableError) as exc_info:
+        limiter_fail.verify_connection(timeout=0.05)
+    assert "timed out after 0.05s" in str(exc_info.value)
